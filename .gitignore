@@ -30,6 +30,9 @@ Desktop.ini
 # Claude Code local settings
 .claude/
 
+# MonoForge AI assistant snapshots (per-turn file backups for Revert)
+.monoforge/
+
 # MonoGame Content Pipeline
 Content/bin/
 Content/obj/

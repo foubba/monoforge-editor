@@ -24,9 +24,11 @@ public sealed class EditorWindow : Window
     private Control? _sceneDock; // cached scene-specific right dock (Outline+Inspector+Layers+SpritePane)
     private Grid? _workspaceGrid;
     private Control? _toolbar; // scene-tool toolbar (Select/Move/Snap/Group/Align/...) — hidden for non-scene tabs
-    // Default column layout for the workspace (assets, splitter, center, splitter, right-dock).
-    private const string WorkspaceColumnsWithDock = "266,4,*,4,282";
-    private const string WorkspaceColumnsNoDock = "266,4,*,0,0";
+    private readonly Panels.AiAssistantPanel _aiPanel = new();
+    // Sidebar is visible by default so the user sees the Install/Auth path without
+    // having to discover the ⌘⇧A shortcut first.
+    private bool _aiPanelVisible = true;
+    private bool _dockVisible = true;
     private readonly Panels.StatisticsPanel _stats = new();
     private readonly ConsolePanel _console = new();
     private readonly DocumentTabHost _tabs = new();
@@ -260,6 +262,7 @@ public sealed class EditorWindow : Window
         // Try to identify the runnable .csproj so Play knows what to launch. The button
         // only enables if we actually found something with OutputType=Exe (or WinExe).
         _runnableCsproj = FindRunnableCsproj(path);
+        _aiPanel.ProjectPath = path;
         if (_runButton is not null) _runButton.IsEnabled = _runnableCsproj is not null;
         if (_runnableCsproj is not null)
             _console.Log("Runnable project detected: " + Path.GetRelativePath(path, _runnableCsproj), "OK");
@@ -322,9 +325,19 @@ public sealed class EditorWindow : Window
             _sceneCanvas.SnapToObjects = !_sceneCanvas.SnapToObjects;
             _console.Log("Snap to objects: " + (_sceneCanvas.SnapToObjects ? "on" : "off"));
         };
+        // Panel-visibility toggles. The header text reflects current state so the user
+        // can tell what hitting it will do without having to hover/check the layout.
+        var aiToggle = new MenuItem { Header = _aiPanelVisible ? "Hide AI Sidebar   ⌘⇧A" : "Show AI Sidebar   ⌘⇧A" };
+        aiToggle.Click += (_, _) =>
+        {
+            ToggleAiPanel();
+            aiToggle.Header = _aiPanelVisible ? "Hide AI Sidebar   ⌘⇧A" : "Show AI Sidebar   ⌘⇧A";
+        };
         view.Items.Add(frame);
         view.Items.Add(new Separator());
         view.Items.Add(grid); view.Items.Add(snap); view.Items.Add(snapToObj); view.Items.Add(pixel);
+        view.Items.Add(new Separator());
+        view.Items.Add(aiToggle);
         return view;
     }
 
@@ -463,9 +476,12 @@ public sealed class EditorWindow : Window
 
     private Control BuildWorkspace()
     {
+        // Columns: assets | split | center | split | rightDock | split | AiSidebar.
+        // Widths for the right dock and the AI sidebar are toggled at runtime; the AI
+        // sidebar starts collapsed (0px), opens to ~360px when the user hits ⌘⇧A.
         var grid = new Grid
         {
-            ColumnDefinitions = new ColumnDefinitions(WorkspaceColumnsWithDock),
+            ColumnDefinitions = new ColumnDefinitions(ComposeWorkspaceColumns()),
             Background = Brush(EditorBackground)
         };
 
@@ -474,8 +490,58 @@ public sealed class EditorWindow : Window
         grid.Children.Add(BuildCenter().At(column: 2));
         grid.Children.Add(VSplitter().At(column: 3));
         grid.Children.Add(BuildRightDock().At(column: 4));
+        // Custom drag handle for the AI panel left edge. Avalonia's GridSplitter doesn't
+        // reliably resize the last column when it sits between two Pixel widths plus a
+        // Star center column; this handle pushes width changes directly into both
+        // adjacent pixel columns so growing the AI panel always works.
+        grid.Children.Add(BuildAiResizeHandle().At(column: 5));
+        grid.Children.Add(_aiPanel.At(column: 6));
+        _aiPanel.ProjectMutated += () =>
+        {
+            if (_projectPath is not null) _assets.LoadProject(_projectPath);
+        };
         _workspaceGrid = grid;
+        ApplyWorkspaceMinimums();
         return grid;
+    }
+
+    /// <summary>Apply minimum widths to each workspace column so a splitter drag can't
+    /// collapse panels to zero and panels can always be grown back.</summary>
+    private void ApplyWorkspaceMinimums()
+    {
+        if (_workspaceGrid is null || _workspaceGrid.ColumnDefinitions.Count < 7) return;
+        _workspaceGrid.ColumnDefinitions[0].MinWidth = 180; // assets
+        _workspaceGrid.ColumnDefinitions[2].MinWidth = 300; // center editor
+        if (_dockVisible) _workspaceGrid.ColumnDefinitions[4].MinWidth = 220;
+        if (_aiPanelVisible) _workspaceGrid.ColumnDefinitions[6].MinWidth = 240;
+    }
+
+    /// <summary>Compose the workspace ColumnDefinitions spec from the two visibility flags.</summary>
+    private string ComposeWorkspaceColumns()
+    {
+        // 6px splitters match VSplitter().Width — narrower splitters were hard to grab.
+        var dock = _dockVisible ? "6,282" : "0,0";
+        var ai = _aiPanelVisible ? "6,360" : "0,0";
+        return $"266,6,*,{dock},{ai}";
+    }
+
+    private void RefreshWorkspaceColumns()
+    {
+        if (_workspaceGrid is null) return;
+        var spec = ComposeWorkspaceColumns();
+        if (_workspaceGrid.ColumnDefinitions.ToString() != spec)
+        {
+            _workspaceGrid.ColumnDefinitions = new ColumnDefinitions(spec);
+            ApplyWorkspaceMinimums();
+        }
+    }
+
+    /// <summary>Open / close the right-edge Claude sidebar (Cursor-style).</summary>
+    private void ToggleAiPanel()
+    {
+        _aiPanelVisible = !_aiPanelVisible;
+        RefreshWorkspaceColumns();
+        if (_aiPanelVisible) _aiPanel.Focus();
     }
 
     private Control BuildCenter()
@@ -528,10 +594,9 @@ public sealed class EditorWindow : Window
 
     private void SetWorkspaceDockVisible(bool visible)
     {
-        if (_workspaceGrid is null) return;
-        var target = visible ? WorkspaceColumnsWithDock : WorkspaceColumnsNoDock;
-        if (_workspaceGrid.ColumnDefinitions.ToString() == target) return;
-        _workspaceGrid.ColumnDefinitions = new ColumnDefinitions(target);
+        if (_dockVisible == visible) return;
+        _dockVisible = visible;
+        RefreshWorkspaceColumns();
     }
 
     /// <summary>Right dock layout used while a sprite scene tab is active.</summary>
@@ -556,14 +621,88 @@ public sealed class EditorWindow : Window
 
     private Control BuildRightDock() => _rightDockHost;
 
+    /// <summary>
+    /// Bespoke vertical drag handle that resizes the AI panel column. Uses raw pointer
+    /// capture instead of GridSplitter — the latter was silently dropping resize events
+    /// for the last column when sat between Pixel and Star definitions. This implementation
+    /// borrows from the right dock when growing and gives back when shrinking, respecting
+    /// the configured MinWidths on both columns.
+    /// </summary>
+    private Control BuildAiResizeHandle()
+    {
+        var handle = new Border
+        {
+            Background = Brush(BorderSubtle),
+            Cursor = new Cursor(StandardCursorType.SizeWestEast),
+            HorizontalAlignment = Avalonia.Layout.HorizontalAlignment.Stretch,
+            VerticalAlignment = Avalonia.Layout.VerticalAlignment.Stretch,
+        };
+
+        var dragging = false;
+        double startX = 0;
+        double startRightDock = 0;
+        double startAi = 0;
+
+        handle.PointerEntered += (_, _) =>
+        {
+            if (!dragging) handle.Background = Brush(Accent);
+        };
+        handle.PointerExited += (_, _) =>
+        {
+            if (!dragging) handle.Background = Brush(BorderSubtle);
+        };
+
+        handle.PointerPressed += (_, e) =>
+        {
+            if (_workspaceGrid is null) return;
+            startX = e.GetPosition(_workspaceGrid).X;
+            startRightDock = _workspaceGrid.ColumnDefinitions[4].ActualWidth;
+            startAi = _workspaceGrid.ColumnDefinitions[6].ActualWidth;
+            dragging = true;
+            e.Pointer.Capture(handle);
+            handle.Background = Brush(Accent);
+        };
+
+        handle.PointerMoved += (_, e) =>
+        {
+            if (!dragging || _workspaceGrid is null) return;
+            // Positive delta = mouse moved left = AI panel grows.
+            var delta = startX - e.GetPosition(_workspaceGrid).X;
+            const double aiMin = 240;
+            const double rightDockMin = 180;
+            var newAi = Math.Max(aiMin, startAi + delta);
+            // Distribute width changes: shrink right dock to feed AI (with floor), and
+            // vice versa when growing right dock back.
+            var aiDelta = newAi - startAi;
+            var newRightDock = Math.Max(rightDockMin, startRightDock - aiDelta);
+            // If right dock hit its floor, clamp AI growth so we don't overflow.
+            var actualRightDockShrink = startRightDock - newRightDock;
+            newAi = startAi + actualRightDockShrink;
+
+            _workspaceGrid.ColumnDefinitions[4].Width = new GridLength(newRightDock);
+            _workspaceGrid.ColumnDefinitions[6].Width = new GridLength(newAi);
+        };
+
+        handle.PointerReleased += (_, e) =>
+        {
+            dragging = false;
+            e.Pointer.Capture(null);
+            handle.Background = Brush(BorderSubtle);
+        };
+
+        return handle;
+    }
+
     private static GridSplitter VSplitter()
     {
         return new GridSplitter
         {
             Background = Brush(BorderSubtle),
-            Width = 4,
+            Width = 6,
             ResizeDirection = GridResizeDirection.Columns,
-            ShowsPreview = false
+            ResizeBehavior = GridResizeBehavior.PreviousAndNext,
+            ShowsPreview = false,
+            Cursor = new Cursor(StandardCursorType.SizeWestEast)
         };
     }
 
@@ -766,6 +905,10 @@ public sealed class EditorWindow : Window
             if (meta && e.KeyModifiers.HasFlag(KeyModifiers.Shift) && e.Key == Key.P)
             {
                 OpenCommandPalette(); e.Handled = true; return;
+            }
+            if (meta && e.KeyModifiers.HasFlag(KeyModifiers.Shift) && e.Key == Key.A)
+            {
+                ToggleAiPanel(); e.Handled = true; return;
             }
             if (meta && e.Key == Key.P) { OpenQuickFile(); e.Handled = true; return; }
             if (meta && e.KeyModifiers.HasFlag(KeyModifiers.Shift) && e.Key == Key.F)
@@ -1888,6 +2031,7 @@ public sealed class EditorWindow : Window
         // Code navigation
         yield return new EditorCommand("Find in Files…", "Code", "⌘⇧F", OpenFindInFiles);
         yield return new EditorCommand("Goto Symbol…", "Code", "⌘T", OpenGotoSymbol);
+        yield return new EditorCommand("Toggle AI Assistant", "Code", "⌘⇧A", ToggleAiPanel);
 
         // Help
         yield return new EditorCommand("Show Keyboard Shortcuts", "Help", "", ShowShortcuts);
