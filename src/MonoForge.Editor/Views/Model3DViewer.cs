@@ -710,6 +710,80 @@ internal sealed class ModelData
 }
 
 /// <summary>
+/// Thin overlay drawn just above the scrub slider showing keyframes as diamonds.
+/// Orange = any joint, yellow = currently-selected joint. Refreshes on PoseChanged /
+/// ClipsChanged / JointSelected and on layout changes.
+/// </summary>
+internal sealed class KeyframeStrip : Control
+{
+    private readonly ModelData _model;
+    private readonly Viewport3D _viewport;
+    // Slider thumb half-width — diamonds need to line up with the visible track range,
+    // not the full Control bounds. Empirically matches the default Avalonia Slider template.
+    private const double SliderPad = 9;
+
+    public KeyframeStrip(ModelData model, Viewport3D viewport)
+    {
+        _model = model;
+        _viewport = viewport;
+        IsHitTestVisible = false;
+        Height = 14;
+    }
+
+    public void Refresh() => InvalidateVisual();
+
+    public override void Render(DrawingContext ctx)
+    {
+        if (_viewport.CurrentClip < 0 || _viewport.CurrentClip >= _model.Animations.Count) return;
+        var clip = _model.Animations[_viewport.CurrentClip];
+        if (clip.Duration <= 0) return;
+
+        var w = Bounds.Width;
+        var h = Bounds.Height;
+        var usable = w - SliderPad * 2;
+        if (usable < 1) return;
+        var cy = h - 4; // bottoms align with the slider track top edge
+
+        // Collect all keyframe times, plus a subset belonging to the currently selected joint.
+        var allTimes = new SortedSet<float>();
+        var selTimes = new HashSet<float>();
+        var selJoint = _viewport.SelectedJoint;
+        foreach (var ch in clip.Channels)
+        {
+            foreach (var t in ch.Times) allTimes.Add(t);
+            if (selJoint >= 0 && ch.JointIndex == selJoint)
+                foreach (var t in ch.Times) selTimes.Add(t);
+        }
+
+        var dimFill = new SolidColorBrush(Color.FromArgb(0xff, 0xc7, 0x86, 0x3e));
+        var dimStroke = new Pen(new SolidColorBrush(Color.FromArgb(0xff, 0x6a, 0x46, 0x1f)), 1);
+        var hotFill = new SolidColorBrush(Color.FromArgb(0xff, 0xff, 0xd1, 0x55));
+        var hotStroke = new Pen(new SolidColorBrush(Color.FromArgb(0xff, 0xa1, 0x6e, 0x14)), 1);
+
+        foreach (var t in allTimes)
+        {
+            var x = SliderPad + (t / clip.Duration) * usable;
+            var hot = selTimes.Contains(t);
+            DrawDiamond(ctx, x, cy, hot ? 5.0 : 4.0, hot ? hotFill : dimFill, hot ? hotStroke : dimStroke);
+        }
+    }
+
+    private static void DrawDiamond(DrawingContext ctx, double cx, double cy, double r, IBrush fill, IPen pen)
+    {
+        var sg = new StreamGeometry();
+        using (var c = sg.Open())
+        {
+            c.BeginFigure(new Point(cx, cy - r), true);
+            c.LineTo(new Point(cx + r, cy));
+            c.LineTo(new Point(cx, cy + r));
+            c.LineTo(new Point(cx - r, cy));
+            c.EndFigure(true);
+        }
+        ctx.DrawGeometry(fill, pen, sg);
+    }
+}
+
+/// <summary>
 /// Bottom timeline: play/pause/reverse, scrubber, primary + secondary clip blend, speed.
 /// </summary>
 internal sealed class TimelineBar : Border
@@ -725,6 +799,7 @@ internal sealed class TimelineBar : Border
     private readonly TextBlock _speedLabel = new() { Foreground = Brush(TextDim), FontFamily = new FontFamily("Menlo"), FontSize = 11, VerticalAlignment = VerticalAlignment.Center, Width = 36 };
     private readonly Button _playBtn;
     private readonly Button _recordBtn;
+    private readonly KeyframeStrip _keyStrip;
     private DispatcherTimer? _timer;
     private DateTime _lastTick;
     private bool _scrubbing;
@@ -733,6 +808,7 @@ internal sealed class TimelineBar : Border
     {
         _model = model;
         _viewport = viewport;
+        _keyStrip = new KeyframeStrip(model, viewport);
         Background = Brush(MenuBackground);
         BorderBrush = Brush(BorderSubtle);
         BorderThickness = new Thickness(0, 1, 0, 0);
@@ -750,6 +826,7 @@ internal sealed class TimelineBar : Border
             _scrub.Value = 0;
             _viewport.CurrentTime = 0;
             _viewport.RequestRedraw();
+            _keyStrip.Refresh();
         };
 
         var clip2Names = new[] { "(none)" }.Concat(clipNames).ToList();
@@ -778,7 +855,13 @@ internal sealed class TimelineBar : Border
                 _clipCombo.SelectedIndex = _viewport.CurrentClip;
                 _scrub.Maximum = Math.Max(0.01, _viewport.CurrentClipDuration);
             }
+            _keyStrip.Refresh();
         });
+
+        // Refresh keyframe markers whenever a key is added, a joint is selected, or layout shifts.
+        _viewport.PoseChanged += () => Avalonia.Threading.Dispatcher.UIThread.Post(() => _keyStrip.Refresh());
+        _viewport.JointSelected += _ => Avalonia.Threading.Dispatcher.UIThread.Post(() => _keyStrip.Refresh());
+        _keyStrip.LayoutUpdated += (_, _) => _keyStrip.Refresh();
 
         _playBtn = new Button
         {
@@ -883,7 +966,11 @@ internal sealed class TimelineBar : Border
         top.Children.Add(_playBtn.At(column: 0));
         top.Children.Add(new TextBlock { Text = "Clip", Foreground = Brush(TextDim), FontSize = 11, VerticalAlignment = VerticalAlignment.Center }.At(column: 1));
         top.Children.Add(_clipCombo.At(column: 2));
-        top.Children.Add(_scrub.At(column: 3));
+        // Stack the keyframe strip above the scrub slider so diamonds appear over the track.
+        var scrubArea = new Grid { RowDefinitions = new RowDefinitions("Auto,*") };
+        scrubArea.Children.Add(_keyStrip.At(row: 0));
+        scrubArea.Children.Add(_scrub.At(row: 1));
+        top.Children.Add(scrubArea.At(column: 3));
         top.Children.Add(_timeLabel.At(column: 4));
         top.Children.Add(new TextBlock { Text = "+", Foreground = Brush(TextDim), FontSize = 11, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(6, 0) }.At(column: 5));
         top.Children.Add(_clip2Combo.At(column: 6));
