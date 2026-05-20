@@ -27,6 +27,9 @@ artifacts/
 Thumbs.db
 Desktop.ini
 
+# Claude Code local settings
+.claude/
+
 # MonoGame Content Pipeline
 Content/bin/
 Content/obj/

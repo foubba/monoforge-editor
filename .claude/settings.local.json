@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "mcp__9817eea8-42ae-4d9b-8cac-f0d2e2667790__notion-update-page",
-      "Bash(dotnet build *)"
-    ]
-  }
-}
