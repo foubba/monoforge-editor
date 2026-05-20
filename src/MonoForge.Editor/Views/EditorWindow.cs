@@ -19,7 +19,14 @@ public sealed class EditorWindow : Window
     private readonly AssetsPanel _assets = new();
     private readonly OutlinePanel _outline = new();
     private readonly InspectorPanel _inspector = new();
+    private readonly ContentControl _rightDockHost = new();
     private readonly Panels.LayersPanel _layers = new();
+    private Control? _sceneDock; // cached scene-specific right dock (Outline+Inspector+Layers+SpritePane)
+    private Grid? _workspaceGrid;
+    private Control? _toolbar; // scene-tool toolbar (Select/Move/Snap/Group/Align/...) — hidden for non-scene tabs
+    // Default column layout for the workspace (assets, splitter, center, splitter, right-dock).
+    private const string WorkspaceColumnsWithDock = "266,4,*,4,282";
+    private const string WorkspaceColumnsNoDock = "266,4,*,0,0";
     private readonly Panels.StatisticsPanel _stats = new();
     private readonly ConsolePanel _console = new();
     private readonly DocumentTabHost _tabs = new();
@@ -44,6 +51,7 @@ public sealed class EditorWindow : Window
         _sceneCanvas.SnapToGrid = settings.SnapToGridDefault;
 
         Title = "MonoForge 0.2";
+        try { Icon = new WindowIcon(MonoForgeLogo.RenderToBitmap(64)); } catch { /* icon is decorative */ }
         Width = 1510;
         Height = 824;
         MinWidth = 1080;
@@ -76,7 +84,8 @@ public sealed class EditorWindow : Window
         };
 
         root.Children.Add(BuildMenuBar().At(row: 0));
-        root.Children.Add(BuildToolbar().At(row: 1));
+        _toolbar = BuildToolbar();
+        root.Children.Add(_toolbar.At(row: 1));
         root.Children.Add(BuildWorkspace().At(row: 2));
         root.Children.Add(BuildStatusBar().At(row: 3));
         return root;
@@ -86,47 +95,51 @@ public sealed class EditorWindow : Window
     {
         var bar = new Grid
         {
-            ColumnDefinitions = new ColumnDefinitions("Auto,*,Auto"),
+            ColumnDefinitions = new ColumnDefinitions("Auto,*"),
             Background = Brush(MenuBackground)
         };
 
         var left = RowStack(MenuBackground);
-        left.Children.Add(Text("◆  MonoForge", TextPrimary, FontWeight.Bold));
-        left.Children.Add(BuildFileMenu());
-        left.Children.Add(BuildEditMenu());
-        left.Children.Add(BuildViewMenu());
-        left.Children.Add(BuildProjectMenu());
-        left.Children.Add(BuildDebugMenu());
-        left.Children.Add(BuildHelpMenu());
+        // Inline logo — sized to roughly match the wordmark cap-height, rendered with
+        // the light palette so it reads against the dark menu strip.
+        left.Children.Add(new MonoForgeLogo(scale: 0.32, light: true)
+        {
+            Margin = new Thickness(10, 0, 6, 0),
+            VerticalAlignment = Avalonia.Layout.VerticalAlignment.Center
+        });
+        left.Children.Add(Text("MonoForge", TextPrimary, FontWeight.Bold));
 
-        var right = RowStack(MenuBackground);
-        right.Children.Add(MenuButton("Undo", (_, _) => Undo()));
-        right.Children.Add(MenuButton("Redo", (_, _) => Redo()));
-        right.Children.Add(MenuButton("Save", async (_, _) => await SaveSceneAsync()));
-        right.Children.Add(MenuButton("Load", async (_, _) => await LoadSceneAsync()));
-        right.Children.Add(MenuButton("Atlas...", (_, _) => new AtlasWindow().Show()));
-        right.Children.Add(MenuButton("Tilemap...", (_, _) => new TilemapEditor().Show()));
-        right.Children.Add(MenuButton("Animation...", (_, _) => new AnimationEditor().Show()));
-        right.Children.Add(MenuButton("Particles...", (_, _) => new ParticleEditor().Show()));
-        right.Children.Add(MenuButton("Preferences...", (_, _) => new SettingsWindow().Show()));
-        right.Children.Add(MenuButton("Scan TODOs", (_, _) => ScanTodos()));
-        right.Children.Add(MenuButton("Sync Content", (_, _) => SyncContent()));
-        right.Children.Add(MenuButton("Export", async (_, _) => await ExportSceneAsync()));
-        right.Children.Add(MenuButton("Build", async (_, _) => await DotnetAsync("build")));
+        // All top-level items share a single Menu so the user can hover between File →
+        // Edit → View etc. and the dropdown follows the cursor (native Avalonia behavior
+        // is only available within one Menu container).
+        var menus = new Menu { Background = Avalonia.Media.Brushes.Transparent };
+        menus.Items.Add(BuildFileMenu());
+        menus.Items.Add(BuildEditMenu());
+        menus.Items.Add(BuildViewMenu());
+        menus.Items.Add(BuildProjectMenu());
+        menus.Items.Add(BuildDebugMenu());
+        menus.Items.Add(BuildHelpMenu());
+        left.Children.Add(menus);
+
+        // Play lives in the menu bar's wide center column so it sits in the dark strip
+        // (rather than over the lighter workspace background). Disabled until a project
+        // is loaded so the user can't trigger a build with nothing to build.
         _runButton = PrimaryButton("▶ Play", async (_, _) => await TogglePlay());
-        right.Children.Add(_runButton);
+        _runButton.HorizontalAlignment = Avalonia.Layout.HorizontalAlignment.Center;
+        _runButton.VerticalAlignment = Avalonia.Layout.VerticalAlignment.Center;
+        _runButton.IsEnabled = false;
 
         bar.Children.Add(left.At(column: 0));
-        bar.Children.Add(right.At(column: 2));
+        bar.Children.Add(_runButton.At(column: 1));
         return bar;
     }
 
-    private Control BuildFileMenu()
+    private MenuItem BuildFileMenu()
     {
-        var menu = new Menu
-        {
-            Background = Avalonia.Media.Brushes.Transparent
-        };
+        // Pre-refactor each Build*Menu returned its own Menu control. To enable native
+        // hover-to-switch behavior between top-level items (File → Edit when the user
+        // drags across the menu bar), they now return a single MenuItem and BuildMenuBar
+        // composes them into one Menu.
         var file = new MenuItem { Header = "File", Foreground = Brush(TextSecondary) };
 
         var newProject = new MenuItem { Header = "New Project..." };
@@ -162,6 +175,10 @@ public sealed class EditorWindow : Window
 
         file.Items.Add(new Separator());
 
+        var openSceneTab = new MenuItem { Header = "Open Scene Tab" };
+        openSceneTab.Click += (_, _) => OpenSceneTab();
+        file.Items.Add(openSceneTab);
+
         var saveScene = new MenuItem { Header = "Save Scene...   ⌘S" };
         saveScene.Click += async (_, _) => await SaveSceneAsync();
         file.Items.Add(saveScene);
@@ -176,8 +193,7 @@ public sealed class EditorWindow : Window
         quickOpen.Click += (_, _) => OpenQuickFile();
         file.Items.Add(quickOpen);
 
-        menu.Items.Add(file);
-        return menu;
+        return file;
     }
 
     private void RefillRecentProjects(MenuItem parent)
@@ -229,6 +245,7 @@ public sealed class EditorWindow : Window
         _projectPath = path;
         Title = $"{Path.GetFileName(path)} - MonoForge 0.2";
         _assets.LoadProject(path);
+        if (_runButton is not null) _runButton.IsEnabled = true;
         _console.Log("Opened project: " + path);
         LoadWorkspace(path);
         Services.UserSettings.Current.PushRecentProject(path);
@@ -236,9 +253,8 @@ public sealed class EditorWindow : Window
         await Task.CompletedTask;
     }
 
-    private Control BuildEditMenu()
+    private MenuItem BuildEditMenu()
     {
-        var menu = new Menu { Background = Avalonia.Media.Brushes.Transparent };
         var edit = new MenuItem { Header = "Edit", Foreground = Brush(TextSecondary) };
         var undo = new MenuItem { Header = "Undo   ⌘Z" };
         undo.Click += (_, _) => Undo();
@@ -263,13 +279,11 @@ public sealed class EditorWindow : Window
         edit.Items.Add(group); edit.Items.Add(ungroup);
         edit.Items.Add(new Separator());
         edit.Items.Add(bf); edit.Items.Add(sb);
-        menu.Items.Add(edit);
-        return menu;
+        return edit;
     }
 
-    private Control BuildViewMenu()
+    private MenuItem BuildViewMenu()
     {
-        var menu = new Menu { Background = Avalonia.Media.Brushes.Transparent };
         var view = new MenuItem { Header = "View", Foreground = Brush(TextSecondary) };
         var frame = new MenuItem { Header = "Frame Scene   F" };
         frame.Click += (_, _) => FrameScene();
@@ -292,13 +306,11 @@ public sealed class EditorWindow : Window
         view.Items.Add(frame);
         view.Items.Add(new Separator());
         view.Items.Add(grid); view.Items.Add(snap); view.Items.Add(snapToObj); view.Items.Add(pixel);
-        menu.Items.Add(view);
-        return menu;
+        return view;
     }
 
-    private Control BuildProjectMenu()
+    private MenuItem BuildProjectMenu()
     {
-        var menu = new Menu { Background = Avalonia.Media.Brushes.Transparent };
         var proj = new MenuItem { Header = "Project", Foreground = Brush(TextSecondary) };
         var atlas = new MenuItem { Header = "Atlas Packer..." };
         atlas.Click += (_, _) => new AtlasWindow().Show();
@@ -323,13 +335,11 @@ public sealed class EditorWindow : Window
         proj.Items.Add(sync); proj.Items.Add(todo); proj.Items.Add(export); proj.Items.Add(exportModel);
         proj.Items.Add(new Separator());
         proj.Items.Add(prefs);
-        menu.Items.Add(proj);
-        return menu;
+        return proj;
     }
 
-    private Control BuildDebugMenu()
+    private MenuItem BuildDebugMenu()
     {
-        var menu = new Menu { Background = Avalonia.Media.Brushes.Transparent };
         var dbg = new MenuItem { Header = "Debug", Foreground = Brush(TextSecondary) };
         var build = new MenuItem { Header = "Build   ⌘B" };
         build.Click += async (_, _) => await DotnetAsync("build");
@@ -343,16 +353,16 @@ public sealed class EditorWindow : Window
         quick.Click += (_, _) => OpenQuickFile();
         var symbol = new MenuItem { Header = "Goto Symbol...   ⌘T" };
         symbol.Click += (_, _) => OpenGotoSymbol();
+        var palette = new MenuItem { Header = "Command Palette...   ⌘⇧P" };
+        palette.Click += (_, _) => OpenCommandPalette();
         dbg.Items.Add(build); dbg.Items.Add(run); dbg.Items.Add(push);
         dbg.Items.Add(new Separator());
-        dbg.Items.Add(findFiles); dbg.Items.Add(quick); dbg.Items.Add(symbol);
-        menu.Items.Add(dbg);
-        return menu;
+        dbg.Items.Add(palette); dbg.Items.Add(findFiles); dbg.Items.Add(quick); dbg.Items.Add(symbol);
+        return dbg;
     }
 
-    private Control BuildHelpMenu()
+    private MenuItem BuildHelpMenu()
     {
-        var menu = new Menu { Background = Avalonia.Media.Brushes.Transparent };
         var help = new MenuItem { Header = "Help", Foreground = Brush(TextSecondary) };
         var about = new MenuItem { Header = "About MonoForge" };
         about.Click += (_, _) =>
@@ -364,8 +374,7 @@ public sealed class EditorWindow : Window
         shortcuts.Click += (_, _) => ShowShortcuts();
         help.Items.Add(about);
         help.Items.Add(shortcuts);
-        menu.Items.Add(help);
-        return menu;
+        return help;
     }
 
     private void ShowShortcuts()
@@ -437,7 +446,7 @@ public sealed class EditorWindow : Window
     {
         var grid = new Grid
         {
-            ColumnDefinitions = new ColumnDefinitions("266,4,*,4,282"),
+            ColumnDefinitions = new ColumnDefinitions(WorkspaceColumnsWithDock),
             Background = Brush(EditorBackground)
         };
 
@@ -446,6 +455,7 @@ public sealed class EditorWindow : Window
         grid.Children.Add(BuildCenter().At(column: 2));
         grid.Children.Add(VSplitter().At(column: 3));
         grid.Children.Add(BuildRightDock().At(column: 4));
+        _workspaceGrid = grid;
         return grid;
     }
 
@@ -456,14 +466,57 @@ public sealed class EditorWindow : Window
             RowDefinitions = new RowDefinitions("*,4,272"),
             Background = Brush(EditorBackground)
         };
-        _tabs.OpenOrFocus(SceneTabKey, _scene.Name, () => _sceneCanvas);
+        _tabs.EmptyContent = new StartPageView();
+        _tabs.ActiveChanged += UpdateContextPanel;
+        // Start with no document open; the user reopens the scene from the menu / palette.
+        UpdateContextPanel(null);
         grid.Children.Add(_tabs.At(row: 0));
         grid.Children.Add(HSplitter().At(row: 1));
         grid.Children.Add(_console.At(row: 2));
         return grid;
     }
 
-    private Control BuildRightDock()
+    /// <summary>
+    /// Swap the right-dock based on the active document. Each document type gets the
+    /// panels that actually relate to it — sprite scenes get the full sprite stack
+    /// (Outline + Inspector + Layers + Stats + Sprite pane); GLBs get the 3D Tools
+    /// palette; code (and anything else) collapses the dock entirely since there's
+    /// nothing scene-specific to show.
+    /// </summary>
+    private void UpdateContextPanel(Control? active)
+    {
+        var isScene = active is SceneCanvas;
+        if (_toolbar is not null) _toolbar.IsVisible = isScene; // scene-only tools row
+
+        if (isScene)
+        {
+            _sceneDock ??= BuildSceneDock();
+            _rightDockHost.Content = _sceneDock;
+            SetWorkspaceDockVisible(true);
+        }
+        else if (active is Model3DViewer viewer)
+        {
+            _rightDockHost.Content = BorderBox(viewer.BuildContextPanel(), BorderSubtle, 1, 0, 0, 0);
+            SetWorkspaceDockVisible(true);
+        }
+        else
+        {
+            // null (no tabs) or code editor / other → no contextual panel; collapse.
+            _rightDockHost.Content = null;
+            SetWorkspaceDockVisible(false);
+        }
+    }
+
+    private void SetWorkspaceDockVisible(bool visible)
+    {
+        if (_workspaceGrid is null) return;
+        var target = visible ? WorkspaceColumnsWithDock : WorkspaceColumnsNoDock;
+        if (_workspaceGrid.ColumnDefinitions.ToString() == target) return;
+        _workspaceGrid.ColumnDefinitions = new ColumnDefinitions(target);
+    }
+
+    /// <summary>Right dock layout used while a sprite scene tab is active.</summary>
+    private Control BuildSceneDock()
     {
         var grid = new Grid
         {
@@ -481,6 +534,8 @@ public sealed class EditorWindow : Window
         grid.Children.Add(BuildSpritePane().At(row: 5));
         return BorderBox(grid, BorderSubtle, 1, 0, 0, 0);
     }
+
+    private Control BuildRightDock() => _rightDockHost;
 
     private static GridSplitter VSplitter()
     {
@@ -689,6 +744,10 @@ public sealed class EditorWindow : Window
             }
             if (meta && e.Key == Key.D) { DuplicateSelected(); e.Handled = true; return; }
             if (meta && e.Key == Key.B) { _ = DotnetAsync("build"); e.Handled = true; return; }
+            if (meta && e.KeyModifiers.HasFlag(KeyModifiers.Shift) && e.Key == Key.P)
+            {
+                OpenCommandPalette(); e.Handled = true; return;
+            }
             if (meta && e.Key == Key.P) { OpenQuickFile(); e.Handled = true; return; }
             if (meta && e.KeyModifiers.HasFlag(KeyModifiers.Shift) && e.Key == Key.F)
             {
@@ -1585,6 +1644,87 @@ public sealed class EditorWindow : Window
         var files = EnumerateProjectFiles(_projectPath).ToList();
         var window = new QuickOpenWindow(files, picked => OpenFileAtLine(picked, 1));
         window.Show(this);
+    }
+
+    private void OpenCommandPalette()
+    {
+        var palette = new CommandPaletteWindow(BuildCommandList());
+        palette.Show(this);
+    }
+
+    /// <summary>Bring the sprite scene back as a tab (used after closing it from the start page).</summary>
+    private void OpenSceneTab()
+    {
+        _tabs.OpenOrFocus(SceneTabKey, _scene.Name, () => _sceneCanvas);
+    }
+
+    /// <summary>
+    /// Single source of truth for every action the user can invoke via ⌘⇧P.
+    /// Mirrors the menu structure but flattens it; categories double as section labels.
+    /// </summary>
+    private IEnumerable<EditorCommand> BuildCommandList()
+    {
+        // File
+        yield return new EditorCommand("New Project…", "File", "", async () =>
+        {
+            var dlg = new NewProjectDialog();
+            await dlg.ShowDialog(this);
+            if (dlg.CreatedAt is { } path) { await OpenProjectFromPath(path); _console.Log("Created project: " + path, "OK"); }
+        });
+        yield return new EditorCommand("Open Project…", "File", "", async () => await OpenProjectAsync());
+        yield return new EditorCommand("Open Scene Tab", "File", "", OpenSceneTab);
+        yield return new EditorCommand("Save Scene", "File", "⌘S", async () => { if (!TrySaveActiveDocument()) await SaveSceneAsync(); });
+        yield return new EditorCommand("Load Scene…", "File", "", async () => await LoadSceneAsync());
+        yield return new EditorCommand("Quick Open File…", "File", "⌘P", OpenQuickFile);
+
+        // Edit
+        yield return new EditorCommand("Undo", "Edit", "⌘Z", Undo);
+        yield return new EditorCommand("Redo", "Edit", "⌘⇧Z", Redo);
+        yield return new EditorCommand("Duplicate Selected", "Edit", "⌘D", DuplicateSelected);
+        yield return new EditorCommand("Delete Selected", "Edit", "⌫", DeleteSelected);
+        yield return new EditorCommand("Group Selection", "Edit", "⌘G", GroupSelection);
+        yield return new EditorCommand("Ungroup Selection", "Edit", "", UngroupSelection);
+        yield return new EditorCommand("Bring to Front", "Edit", "⌘]", BringToFront);
+        yield return new EditorCommand("Send to Back", "Edit", "⌘[", SendToBack);
+        yield return new EditorCommand("Z-Order Forward", "Edit", "⌘⇧]", ZOrderForward);
+        yield return new EditorCommand("Z-Order Backward", "Edit", "⌘⇧[", ZOrderBackward);
+        yield return new EditorCommand("Flip Horizontal", "Edit", "H", () => FlipSelected(horizontal: true));
+        yield return new EditorCommand("Flip Vertical", "Edit", "V", () => FlipSelected(horizontal: false));
+
+        // View
+        yield return new EditorCommand("Frame Scene", "View", "F", FrameScene);
+        yield return new EditorCommand("Toggle Grid", "View", "G", ToggleGrid);
+        yield return new EditorCommand("Toggle Snap", "View", "", ToggleSnap);
+        yield return new EditorCommand("Toggle Pixel-Perfect", "View", "", () => { _sceneCanvas.PixelPerfect = !_sceneCanvas.PixelPerfect; _console.Log("Pixel-perfect: " + (_sceneCanvas.PixelPerfect ? "on" : "off")); });
+        yield return new EditorCommand("Toggle Snap to Objects", "View", "", () => { _sceneCanvas.SnapToObjects = !_sceneCanvas.SnapToObjects; _console.Log("Snap to objects: " + (_sceneCanvas.SnapToObjects ? "on" : "off")); });
+
+        // Tools
+        yield return new EditorCommand("Tool: Select", "Tool", "S", () => SetTool("select"));
+        yield return new EditorCommand("Tool: Move", "Tool", "M", () => SetTool("move"));
+        yield return new EditorCommand("Tool: Rect", "Tool", "R", () => SetTool("rect"));
+
+        // Project
+        yield return new EditorCommand("Atlas Packer…", "Project", "", () => new AtlasWindow().Show());
+        yield return new EditorCommand("Tilemap Editor…", "Project", "", () => new TilemapEditor().Show());
+        yield return new EditorCommand("Animation Editor…", "Project", "", () => new AnimationEditor().Show());
+        yield return new EditorCommand("Particle Editor…", "Project", "", () => new ParticleEditor().Show());
+        yield return new EditorCommand("Sync to Content/", "Project", "", SyncContent);
+        yield return new EditorCommand("Scan TODOs", "Project", "", ScanTodos);
+        yield return new EditorCommand("Export Scene as C#…", "Project", "", async () => await ExportSceneAsync());
+        yield return new EditorCommand("Emit GLB Runtime Loader…", "Project", "", async () => await ExportModelRuntimeAsync());
+        yield return new EditorCommand("Preferences…", "Project", "", () => new SettingsWindow().Show());
+
+        // Debug / build
+        yield return new EditorCommand("Build", "Debug", "⌘B", async () => await DotnetAsync("build"));
+        yield return new EditorCommand("Run with Live Reload", "Debug", "⌘R", async () => await TogglePlay());
+        yield return new EditorCommand("Push Live Reload", "Debug", "⌘E", PushLiveReload);
+
+        // Code navigation
+        yield return new EditorCommand("Find in Files…", "Code", "⌘⇧F", OpenFindInFiles);
+        yield return new EditorCommand("Goto Symbol…", "Code", "⌘T", OpenGotoSymbol);
+
+        // Help
+        yield return new EditorCommand("Show Keyboard Shortcuts", "Help", "", ShowShortcuts);
     }
 
     private static IEnumerable<string> EnumerateProjectFiles(string root)

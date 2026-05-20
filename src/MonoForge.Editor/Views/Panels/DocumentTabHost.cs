@@ -20,6 +20,21 @@ public sealed class DocumentTabHost : UserControl
     private readonly ContentControl _body = new();
     private readonly List<Document> _documents = new();
     private Document? _active;
+    private Control? _emptyContent;
+
+    /// <summary>Fires whenever the active document changes (including null when none remain).</summary>
+    public event Action<Control?>? ActiveChanged;
+
+    /// <summary>Optional placeholder shown in the body whenever no documents are open.</summary>
+    public Control? EmptyContent
+    {
+        get => _emptyContent;
+        set
+        {
+            _emptyContent = value;
+            if (_active is null) _body.Content = value;
+        }
+    }
 
     public DocumentTabHost()
     {
@@ -91,7 +106,8 @@ public sealed class DocumentTabHost : UserControl
             else
             {
                 _active = null;
-                _body.Content = null;
+                _body.Content = _emptyContent;
+                ActiveChanged?.Invoke(null);
             }
         }
     }
@@ -114,6 +130,7 @@ public sealed class DocumentTabHost : UserControl
         _active = doc;
         _body.Content = doc.Content;
         RebuildTabs();
+        ActiveChanged?.Invoke(doc.Content);
     }
 
     private void RebuildTabs()

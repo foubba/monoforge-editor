@@ -42,7 +42,7 @@ public sealed class AssetsPanel : UserControl
             Background = Brush(PanelBackground)
         };
         header.Children.Add(Text("Assets", TextMuted).WithMargin(12, 10, 10, 0).At(column: 0));
-        header.Children.Add(MenuButton("Open Project", (_, _) => OpenProjectRequested?.Invoke()).At(column: 1));
+        // "Open Project" button removed — already available in File menu / Command Palette.
         grid.Children.Add(header.At(row: 0));
 
         _tree.Background = Brush(PanelBackground);
@@ -144,7 +144,9 @@ public sealed class AssetsPanel : UserControl
         _rootPath = rootPath;
         _gitStatus = MonoForge.Editor.Services.GitStatus.Read(rootPath);
         var root = BuildNode(new DirectoryInfo(rootPath), 0);
-        _tree.ItemsSource = new[] { BuildItem(root) };
+        var rootItem = BuildItem(root);
+        rootItem.IsExpanded = true; // only the project root opens automatically
+        _tree.ItemsSource = new[] { rootItem };
         StartWatcher(rootPath);
     }
 
@@ -247,7 +249,10 @@ public sealed class AssetsPanel : UserControl
         {
             Header = Label(node),
             Tag = node,
-            IsExpanded = node.IsDirectory,
+            // Start collapsed — the project root and every folder is closed by default.
+            // The user expands what they need; auto-opening every folder makes large
+            // projects feel cluttered on first load.
+            IsExpanded = false,
             MinHeight = 18,
             Padding = new Thickness(0)
         };

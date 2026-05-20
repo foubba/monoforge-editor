@@ -87,6 +87,90 @@ public sealed class Model3DViewer : UserControl
         UpdateStats();
     }
 
+    /// <summary>
+    /// Returns a compact "3D Tools" palette designed to live in the editor's right dock
+    /// while this viewer is the active document. Mirrors the in-tab toolbar so the user
+    /// can drive the viewport from either place; the right dock keeps it visible even if
+    /// the tab area is narrowed.
+    /// </summary>
+    public Control BuildContextPanel()
+    {
+        if (_viewport is null || _model is null)
+        {
+            return new TextBlock { Text = "Model failed to load.", Foreground = Brush(TextDim), Padding = new Thickness(12) };
+        }
+
+        var stack = new StackPanel { Spacing = 6, Margin = new Thickness(10) };
+        stack.Children.Add(new TextBlock { Text = "3D Tools", Foreground = Brush(TextMuted), FontSize = 11 });
+
+        var cam = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 4 };
+        cam.Children.Add(MenuButton("Reset", (_, _) => _viewport.ResetCamera()));
+        cam.Children.Add(MenuButton("Frame", (_, _) => _viewport.FrameModel()));
+        stack.Children.Add(cam);
+
+        // Two-column grid of toggles so the palette stays narrow.
+        var toggles = new Grid
+        {
+            ColumnDefinitions = new ColumnDefinitions("*,*"),
+            RowDefinitions = new RowDefinitions("Auto,Auto,Auto"),
+            ColumnSpacing = 4,
+            RowSpacing = 4
+        };
+        Control Wire = ToggleBtn("Wireframe", () => _viewport.Wireframe, v => { _viewport.Wireframe = v; _viewport.RequestRedraw(); });
+        Control Edges = ToggleBtn("Edges", () => _viewport.OverlayWires, v => { _viewport.OverlayWires = v; _viewport.RequestRedraw(); });
+        Control Tex = ToggleBtn("Textures", () => _viewport.UseTextures, v => { _viewport.UseTextures = v; _viewport.RequestRedraw(); });
+        Control Skel = ToggleBtn("Skeleton", () => _viewport.ShowSkeleton, v => { _viewport.ShowSkeleton = v; _viewport.RequestRedraw(); });
+        Control Norm = ToggleBtn("Normals", () => _viewport.ShowNormals, v => { _viewport.ShowNormals = v; _viewport.RequestRedraw(); });
+        Control Side = ToggleBtn("Sidebar", () => _sidebarVisible, v =>
+        {
+            _sidebarVisible = v;
+            _layoutGrid.ColumnDefinitions = _sidebarVisible ? new ColumnDefinitions("*,260") : new ColumnDefinitions("*,0");
+        });
+        toggles.Children.Add(Wire.At(row: 0, column: 0));
+        toggles.Children.Add(Edges.At(row: 0, column: 1));
+        toggles.Children.Add(Tex.At(row: 1, column: 0));
+        toggles.Children.Add(Skel.At(row: 1, column: 1));
+        toggles.Children.Add(Norm.At(row: 2, column: 0));
+        toggles.Children.Add(Side.At(row: 2, column: 1));
+        stack.Children.Add(toggles);
+
+        stack.Children.Add(new TextBlock { Text = "Model", Foreground = Brush(TextMuted), FontSize = 11, Margin = new Thickness(0, 8, 0, 0) });
+        var info = new TextBlock
+        {
+            Text = $"verts: {_model.VertexCount}\ntris:  {_model.TriangleCount}\njoints: {_model.JointCount}\nclips:  {_model.Animations.Count}",
+            Foreground = Brush(TextDim),
+            FontFamily = new FontFamily("Menlo"),
+            FontSize = 11,
+            TextWrapping = TextWrapping.Wrap
+        };
+        stack.Children.Add(info);
+
+        var autoRig = new Button
+        {
+            Content = "AutoRig…",
+            Background = Brush(FilterBackground),
+            BorderBrush = Brush(BorderColor),
+            Foreground = Brush(TextSecondary),
+            FontSize = 12,
+            Padding = new Thickness(8, 4),
+            HorizontalAlignment = Avalonia.Layout.HorizontalAlignment.Stretch,
+            Margin = new Thickness(0, 8, 0, 0)
+        };
+        autoRig.Click += (_, _) =>
+        {
+            var center = (_model.Min + _model.Max) * 0.5f;
+            new AutoRigDialog((center.X, center.Y, center.Z)).Show(this.FindAncestorOfType<Window>() ?? new Window());
+        };
+        stack.Children.Add(autoRig);
+
+        return new ScrollViewer
+        {
+            Content = stack,
+            Background = Brush(PanelBackground),
+            HorizontalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Disabled
+        };
+    }
+
     private static Button ToggleBtn(string label, Func<bool> get, Action<bool> set)
     {
         var btn = new Button
