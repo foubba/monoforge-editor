@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>MonoForge Editor</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="menubar">
+        <div class="brand">
+          <span class="brand-mark"></span>
+          <span>MonoForge</span>
+        </div>
+        <nav class="menus" aria-label="Menu">
+          <button>File</button>
+          <button>Edit</button>
+          <button>View</button>
+          <button>Project</button>
+          <button>Debug</button>
+          <button>Help</button>
+        </nav>
+        <div class="window-actions">
+          <button id="saveScene">Save</button>
+          <button id="loadScene">Load</button>
+          <input id="sceneFile" type="file" accept="application/json">
+          <button id="buildProject" class="primary">Build</button>
+        </div>
+      </header>
+
+      <section class="toolbar" aria-label="Tools">
+        <button class="tool active" data-tool="select" title="Select">S</button>
+        <button class="tool" data-tool="move" title="Move">M</button>
+        <button class="tool" data-tool="rect" title="Add sprite">R</button>
+        <span class="divider"></span>
+        <button id="frameScene" title="Frame scene">F</button>
+        <button id="toggleGrid" class="active" title="Toggle grid">Grid</button>
+        <span class="toolbar-status" id="toolbarStatus">Ready</span>
+      </section>
+
+      <main class="workspace">
+        <aside class="pane assets-pane">
+          <div class="pane-title">
+            <span>Assets</span>
+            <button id="addSpriteAsset" title="New sprite">+</button>
+          </div>
+          <div class="asset-tree" id="assetTree"></div>
+          <div class="changed-files">
+            <div class="subhead">Changed Files</div>
+            <div class="changed-row">scenes/main.scene.json</div>
+            <div class="changed-row">sprites/player.sprite</div>
+          </div>
+        </aside>
+
+        <section class="center-stack">
+          <div class="tabs">
+            <button class="tab active">main.collection</button>
+            <button class="tab">player.sprite</button>
+          </div>
+          <div class="scene-wrap">
+            <canvas id="sceneCanvas" width="1280" height="760"></canvas>
+            <div class="scene-hud">
+              <span id="zoomLabel">100%</span>
+              <span>2D</span>
+            </div>
+          </div>
+        </section>
+
+        <aside class="right-stack">
+          <section class="pane outline-pane">
+            <div class="pane-title">
+              <span>Outline</span>
+              <button id="duplicateObject" title="Duplicate">D</button>
+            </div>
+            <div id="outlineTree" class="outline-tree"></div>
+          </section>
+
+          <section class="pane properties-pane">
+            <div class="pane-title">
+              <span>Properties</span>
+              <button id="deleteObject" title="Delete">Del</button>
+            </div>
+            <form id="propertiesForm" class="properties"></form>
+          </section>
+        </aside>
+      </main>
+
+      <footer class="bottom-tools">
+        <section class="console">
+          <div class="tool-tabs">
+            <button class="active">Console</button>
+            <button>Build Errors</button>
+            <button>Search Results</button>
+          </div>
+          <div id="consoleOutput" class="console-output"></div>
+        </section>
+        <section class="sprite-lab">
+          <div class="sprite-head">
+            <span>Sprite Editor</span>
+            <div class="palette" id="palette"></div>
+          </div>
+          <canvas id="spriteCanvas" width="192" height="192"></canvas>
+        </section>
+      </footer>
+
+      <div class="statusbar">
+        <span id="statusPath">/sample_project/main.collection</span>
+        <span id="statusSelection">No selection</span>
+      </div>
+    </div>
+
+    <script src="main.js"></script>
+  </body>
+</html>

@@ -1,0 +1,19 @@
+{
+  "scene": {
+    "name": "main.collection",
+    "objects": [
+      {
+        "id": "player",
+        "name": "Player",
+        "type": "Sprite",
+        "x": 120,
+        "y": 96,
+        "width": 64,
+        "height": 64,
+        "color": "#65a7ff",
+        "layer": 2,
+        "visible": true
+      }
+    ]
+  }
+}
