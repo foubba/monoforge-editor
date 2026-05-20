@@ -710,9 +710,12 @@ internal sealed class ModelData
 }
 
 /// <summary>
-/// Thin overlay drawn just above the scrub slider showing keyframes as diamonds.
-/// Orange = any joint, yellow = currently-selected joint. Refreshes on PoseChanged /
-/// ClipsChanged / JointSelected and on layout changes.
+/// Strip drawn just above the scrub slider showing keyframes as diamonds. Orange =
+/// any joint, yellow = currently-selected joint. Supports:
+///   - left-click + drag on a diamond to retime that frame across every joint that
+///     shares it (clamped to immediate neighbors so the array stays sorted),
+///   - right-click on a diamond to delete the entire frame.
+/// Refreshes on PoseChanged / ClipsChanged / JointSelected and on layout changes.
 /// </summary>
 internal sealed class KeyframeStrip : Control
 {
@@ -721,13 +724,24 @@ internal sealed class KeyframeStrip : Control
     // Slider thumb half-width — diamonds need to line up with the visible track range,
     // not the full Control bounds. Empirically matches the default Avalonia Slider template.
     private const double SliderPad = 9;
+    private const float TimeEps = 1e-4f;
+
+    // Drag state. While dragging we mutate channel Times[] in place; the clamping
+    // to (leftBound, rightBound) guarantees we never cross a neighboring key, so
+    // the arrays remain sorted without any post-processing.
+    private sealed record DragKey(AnimChannel Channel, int Index);
+    private List<DragKey>? _dragKeys;
+    private double _dragLeftBound, _dragRightBound;
+    private float _dragOrigGroupTime;
+    private double _dragStartX;
 
     public KeyframeStrip(ModelData model, Viewport3D viewport)
     {
         _model = model;
         _viewport = viewport;
-        IsHitTestVisible = false;
-        Height = 14;
+        Height = 18;
+        Cursor = new Cursor(StandardCursorType.Hand);
+        Focusable = true;
     }
 
     public void Refresh() => InvalidateVisual();
@@ -742,7 +756,7 @@ internal sealed class KeyframeStrip : Control
         var h = Bounds.Height;
         var usable = w - SliderPad * 2;
         if (usable < 1) return;
-        var cy = h - 4; // bottoms align with the slider track top edge
+        var cy = h - 5; // bottoms align with the slider track top edge
 
         // Collect all keyframe times, plus a subset belonging to the currently selected joint.
         var allTimes = new SortedSet<float>();
@@ -780,6 +794,119 @@ internal sealed class KeyframeStrip : Control
             c.EndFigure(true);
         }
         ctx.DrawGeometry(fill, pen, sg);
+    }
+
+    /// <summary>Find a keyframe within ~7px of the click; return its group time if any.</summary>
+    private float? HitTest(Point pt, AnimClip clip, double usable)
+    {
+        if (clip.Duration <= 0 || usable < 1) return null;
+        var mouseTime = (pt.X - SliderPad) / usable * clip.Duration;
+        var pxTol = 7.0 / usable * clip.Duration;
+        var allTimes = new HashSet<float>();
+        foreach (var ch in clip.Channels) foreach (var t in ch.Times) allTimes.Add(t);
+        float? hit = null;
+        var best = pxTol;
+        foreach (var t in allTimes)
+        {
+            var d = Math.Abs(t - mouseTime);
+            if (d <= best) { best = d; hit = t; }
+        }
+        return hit;
+    }
+
+    protected override void OnPointerPressed(PointerPressedEventArgs e)
+    {
+        base.OnPointerPressed(e);
+        if (_viewport.CurrentClip < 0 || _viewport.CurrentClip >= _model.Animations.Count) return;
+        var clip = _model.Animations[_viewport.CurrentClip];
+        var usable = Bounds.Width - SliderPad * 2;
+        var hit = HitTest(e.GetPosition(this), clip, usable);
+        if (hit is null) return;
+
+        var props = e.GetCurrentPoint(this).Properties;
+        if (props.IsRightButtonPressed)
+        {
+            // Delete every key sitting at this group time across all channels.
+            foreach (var ch in clip.Channels)
+            {
+                for (var i = 0; i < ch.Times.Length; i++)
+                {
+                    if (Math.Abs(ch.Times[i] - hit.Value) < TimeEps) { ch.RemoveKeyAt(hit.Value); break; }
+                }
+            }
+            _viewport.NotifyPoseChanged();
+            _viewport.RequestRedraw();
+            Refresh();
+            e.Handled = true;
+            return;
+        }
+
+        // Collect every (channel, index) whose key is at this group time, plus the
+        // tightest (leftBound, rightBound) so the user can't drag across a neighbor.
+        var keys = new List<DragKey>();
+        double leftBound = 0.0;
+        double rightBound = clip.Duration;
+        foreach (var ch in clip.Channels)
+        {
+            for (var i = 0; i < ch.Times.Length; i++)
+            {
+                if (Math.Abs(ch.Times[i] - hit.Value) < TimeEps)
+                {
+                    keys.Add(new DragKey(ch, i));
+                    if (i > 0) leftBound = Math.Max(leftBound, ch.Times[i - 1]);
+                    if (i < ch.Times.Length - 1) rightBound = Math.Min(rightBound, ch.Times[i + 1]);
+                    break;
+                }
+            }
+        }
+        if (keys.Count == 0) return;
+
+        _dragKeys = keys;
+        _dragLeftBound = leftBound;
+        _dragRightBound = rightBound;
+        _dragOrigGroupTime = hit.Value;
+        _dragStartX = e.GetPosition(this).X;
+        e.Pointer.Capture(this);
+        e.Handled = true;
+    }
+
+    protected override void OnPointerMoved(PointerEventArgs e)
+    {
+        base.OnPointerMoved(e);
+        if (_dragKeys is null) return;
+        if (_viewport.CurrentClip < 0 || _viewport.CurrentClip >= _model.Animations.Count) return;
+        var clip = _model.Animations[_viewport.CurrentClip];
+        var usable = Bounds.Width - SliderPad * 2;
+        if (usable < 1) return;
+
+        var dx = e.GetPosition(this).X - _dragStartX;
+        var dt = dx / usable * clip.Duration;
+        var minT = _dragLeftBound + TimeEps;
+        var maxT = _dragRightBound - TimeEps;
+        if (minT >= maxT) return; // no room to move
+        var newTime = (float)Math.Clamp(_dragOrigGroupTime + dt, minT, maxT);
+
+        // Mutate in place — clamping above guarantees the sort order is preserved.
+        foreach (var dk in _dragKeys)
+        {
+            if (dk.Index >= 0 && dk.Index < dk.Channel.Times.Length)
+                dk.Channel.Times[dk.Index] = newTime;
+        }
+        // Live preview — let the viewport re-evaluate the current pose with the new timing.
+        _viewport.RequestRedraw();
+        Refresh();
+    }
+
+    protected override void OnPointerReleased(PointerReleasedEventArgs e)
+    {
+        base.OnPointerReleased(e);
+        if (_dragKeys is null) return;
+        _dragKeys = null;
+        e.Pointer.Capture(null);
+        // Final pose-changed broadcast so dependent UI (e.g. joint TRS readouts) refreshes.
+        _viewport.NotifyPoseChanged();
+        _viewport.RequestRedraw();
+        Refresh();
     }
 }
 
