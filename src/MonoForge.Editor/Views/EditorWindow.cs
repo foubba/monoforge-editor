@@ -39,6 +39,10 @@ public sealed class EditorWindow : Window
     private bool _isRunning;
 
     private string? _projectPath;
+    // Resolved executable .csproj for the current project (e.g. "Game.DesktopGL.csproj").
+    // Multi-project solutions usually have a shared library + one or more platform targets;
+    // this is the one we hand to `dotnet run`. null until OpenProjectFromPath finds one.
+    private string? _runnableCsproj;
     private SceneDocument _scene = SeedScene();
     private string? _selectedId = "player";
     private string _activeColor = "#65a7ff";
@@ -70,6 +74,14 @@ public sealed class EditorWindow : Window
             _console.Log("Texture reloaded");
         };
         _console.BuildErrorClicked += (path, line) => OpenFileAtLine(path, line);
+        // Stream each parsed compiler diagnostic into the matching open code tab so the
+        // user sees red squiggles inline and red markers in the minimap. We accumulate
+        // them while a build runs and replace the editor's set on each diagnostic so the
+        // UI updates progressively rather than only after the whole build finishes.
+        _console.DiagnosticParsed += (path, line, severity, code, msg) =>
+        {
+            Avalonia.Threading.Dispatcher.UIThread.Post(() => PushDiagnostic(path, line, severity, code, msg));
+        };
         _layers.VisibilityChanged += () => _sceneCanvas.InvalidateVisual();
         _layers.LockChanged += () => { RenderAll(); };
         _console.Log("Open a project folder to populate Assets.");
@@ -245,7 +257,14 @@ public sealed class EditorWindow : Window
         _projectPath = path;
         Title = $"{Path.GetFileName(path)} - MonoForge 0.2";
         _assets.LoadProject(path);
-        if (_runButton is not null) _runButton.IsEnabled = true;
+        // Try to identify the runnable .csproj so Play knows what to launch. The button
+        // only enables if we actually found something with OutputType=Exe (or WinExe).
+        _runnableCsproj = FindRunnableCsproj(path);
+        if (_runButton is not null) _runButton.IsEnabled = _runnableCsproj is not null;
+        if (_runnableCsproj is not null)
+            _console.Log("Runnable project detected: " + Path.GetRelativePath(path, _runnableCsproj), "OK");
+        else
+            _console.Log("No runnable .csproj found (no <OutputType>Exe</OutputType>). Play stays disabled.", "WARN");
         _console.Log("Opened project: " + path);
         LoadWorkspace(path);
         Services.UserSettings.Current.PushRecentProject(path);
@@ -754,6 +773,7 @@ public sealed class EditorWindow : Window
                 OpenFindInFiles(); e.Handled = true; return;
             }
             if (meta && e.Key == Key.R) { _ = DotnetAsync("run"); e.Handled = true; return; }
+            if (meta && (e.Key == Key.Enter || e.Key == Key.Return)) { _ = RunCurrentFileAsync(); e.Handled = true; return; }
             if (meta && e.Key == Key.E) { PushLiveReload(); e.Handled = true; return; }
             if (meta && e.Key == Key.T) { OpenGotoSymbol(); e.Handled = true; return; }
             if (meta && e.Key == Key.G) { GroupSelection(); e.Handled = true; return; }
@@ -1309,12 +1329,9 @@ public sealed class EditorWindow : Window
         var folder = folders.FirstOrDefault();
         if (folder?.Path.LocalPath is not { Length: > 0 } path) return;
 
-        _projectPath = path;
-        Title = $"{Path.GetFileName(path)} - MonoForge 0.2";
-        _assets.LoadProject(path);
-        _console.Log("Opened project: " + path);
-        LoadWorkspace(path);
-        Services.UserSettings.Current.PushRecentProject(path);
+        // Route through the unified entry point so runnable-csproj detection, Play-button
+        // enabling, recent-projects, and workspace-load all run in one place.
+        await OpenProjectFromPath(path);
         UpdateStatus();
     }
 
@@ -1446,6 +1463,83 @@ public sealed class EditorWindow : Window
         _console.Log("Generated MonoGame C# scene file", "OK");
     }
 
+    /// <summary>
+    /// Find every open CodeEditor tab whose path matches and add a diagnostic to it,
+    /// then push the updated set so the squiggle + minimap marker show up.
+    /// </summary>
+    private void PushDiagnostic(string filePath, int line, string severity, string code, string msg)
+    {
+        // The msbuild path may be absolute or workspace-relative; normalize both.
+        var normalized = Path.GetFullPath(filePath, _projectPath ?? Environment.CurrentDirectory);
+        foreach (var content in _tabs.OpenContents)
+        {
+            if (content is not CodeEditor ed) continue;
+            if (!string.Equals(ed.FilePath, normalized, StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(ed.FilePath, filePath, StringComparison.OrdinalIgnoreCase)) continue;
+            ed.AddDiagnostic(new DiagnosticInfo(line, severity, code, msg));
+            return;
+        }
+    }
+
+    /// <summary>Clear diagnostics on every open code tab. Called before each build.</summary>
+    private void ClearAllDiagnostics()
+    {
+        foreach (var content in _tabs.OpenContents)
+        {
+            if (content is CodeEditor ed) ed.ClearDiagnostics();
+        }
+    }
+
+    /// <summary>
+    /// Save every dirty CodeEditor tab to disk and return how many were written. Called
+    /// before build/run so the compiler sees the user's latest changes — without this,
+    /// edits in unsaved tabs are invisible to dotnet and "the build passed" lies.
+    /// </summary>
+    private int SaveAllDirtyEditors()
+    {
+        var count = 0;
+        foreach (var content in _tabs.OpenContents)
+        {
+            if (content is CodeEditor ed && ed.IsDirty && ed.Save())
+            {
+                _tabs.SetDirty(ed.FilePath, false);
+                count++;
+            }
+        }
+        return count;
+    }
+
+    /// <summary>
+    /// Walk the project tree looking for a .csproj that declares OutputType=Exe (or WinExe).
+    /// In a typical multi-project MonoGame solution this is the platform target (e.g.
+    /// Game.DesktopGL/Game.DesktopGL.csproj) — the shared library lacks OutputType and so
+    /// is correctly skipped.
+    /// </summary>
+    private static string? FindRunnableCsproj(string projectRoot)
+    {
+        IEnumerable<string> all;
+        try { all = Directory.EnumerateFiles(projectRoot, "*.csproj", SearchOption.AllDirectories); }
+        catch { return null; }
+
+        string? fallback = null;
+        foreach (var csproj in all)
+        {
+            fallback ??= csproj;
+            string text;
+            try { text = File.ReadAllText(csproj); }
+            catch { continue; }
+            // Quick string check is enough — XML parsing would be overkill for this hint.
+            if (text.Contains("<OutputType>Exe</OutputType>", StringComparison.OrdinalIgnoreCase) ||
+                text.Contains("<OutputType>WinExe</OutputType>", StringComparison.OrdinalIgnoreCase))
+            {
+                return csproj;
+            }
+        }
+        // No executable found → return null. The caller decides what to do (we leave Play
+        // disabled rather than guess a library project that would just fail at runtime).
+        return null;
+    }
+
     private async Task TogglePlay()
     {
         if (_isRunning)
@@ -1458,29 +1552,85 @@ public sealed class EditorWindow : Window
         }
 
         if (_projectPath is null) { _console.Log("Open a project first.", "WARN"); return; }
-        var csproj = Directory.EnumerateFiles(_projectPath, "*.csproj", SearchOption.AllDirectories).FirstOrDefault();
-        if (csproj is null) { _console.Log("No .csproj found.", "ERR"); return; }
+        var csproj = _runnableCsproj;
+        if (csproj is null) { _console.Log("No runnable .csproj (OutputType=Exe) in this project.", "ERR"); return; }
 
-        PushLiveReload();
+        // Same as Build: save every dirty editor before launching so the compiler sees
+        // the user's pending changes.
+        var savedForRun = SaveAllDirtyEditors();
+        if (savedForRun > 0) _console.Log($"Saved {savedForRun} editor{(savedForRun == 1 ? "" : "s")} before run.");
+        ClearAllDiagnostics();
+
+        // Play is intentionally a clean `dotnet run` — equivalent to running the game
+        // from the command line. The live-reload push has its own ⌘E shortcut and menu
+        // entry, so the user opts into it explicitly instead of paying the cost on every
+        // Play (it can fail silently in projects without the runtime helper installed).
         _isRunning = true;
         if (_runButton is not null) _runButton.Content = "◼ Stop";
         _runCts = new CancellationTokenSource();
-        _console.Log("Launching game with live reload watcher...", "OK");
+        _console.Log($"dotnet run --project {Path.GetFileName(csproj)}", "OK");
         _console.ResetBuild();
         _console.FocusBuildTab();
 
         var token = _runCts.Token;
+        // Same flags as Build (see DotnetAsync) — disable terminal logger so the regex can
+        // pick up compile-time errors emitted during the implicit build phase of `run`.
         var exit = await ProcessRunner.RunAsync(
             "dotnet",
-            $"run --project \"{csproj}\"",
+            $"run --project \"{csproj}\" -tl:off -nologo -v minimal",
             _projectPath,
             line => Avalonia.Threading.Dispatcher.UIThread.Post(() => _console.LogBuild(line)),
-            line => Avalonia.Threading.Dispatcher.UIThread.Post(() => _console.LogBuild(line)),
+            line => Avalonia.Threading.Dispatcher.UIThread.Post(() => _console.LogBuildError(line)),
             token);
 
         _isRunning = false;
         if (_runButton is not null) _runButton.Content = "▶ Play";
-        _console.Log($"Game exited with {exit}", exit == 0 ? "OK" : "ERR");
+        var (rErrs, rWarns) = _console.BuildCounts;
+        _console.Log($"Game exited with {exit}  ({rErrs} error{(rErrs == 1 ? "" : "s")}, {rWarns} warning{(rWarns == 1 ? "" : "s")})", exit == 0 && rErrs == 0 ? "OK" : "ERR");
+    }
+
+    /// <summary>
+    /// Run the script in the currently-focused code tab. Today supports Python (.py via
+    /// `python3`) and shell scripts (.sh / .bash). Output is piped live to the Build tab.
+    /// For C# files inside a .csproj project, the user should use Build/Run (⌘B / ⌘R)
+    /// instead — we surface a friendly hint in that case.
+    /// </summary>
+    private async Task RunCurrentFileAsync()
+    {
+        if (_tabs.ActiveContent is not CodeEditor ed)
+        {
+            _console.Log("Open a code file first.", "WARN");
+            return;
+        }
+        var path = ed.FilePath;
+        var ext = Path.GetExtension(path).ToLowerInvariant();
+        string exe; string args;
+        switch (ext)
+        {
+            case ".py":
+                exe = "python3"; args = $"\"{path}\""; break;
+            case ".sh": case ".bash":
+                exe = "bash"; args = $"\"{path}\""; break;
+            case ".js":
+                exe = "node"; args = $"\"{path}\""; break;
+            case ".cs":
+                _console.Log("⌘B / ⌘R compiles and runs the C# project. Run-current-file is for scripts (.py, .sh, .js).", "WARN");
+                return;
+            default:
+                _console.Log($"No runner registered for '{ext}'. Use ⌘B for C# projects.", "WARN");
+                return;
+        }
+
+        _console.Log($"{exe} {Path.GetFileName(path)}");
+        _console.ResetBuild();
+        _console.FocusBuildTab();
+        var cwd = Path.GetDirectoryName(path) ?? _projectPath ?? Environment.CurrentDirectory;
+        var exit = await ProcessRunner.RunAsync(
+            exe, args, cwd,
+            line => Avalonia.Threading.Dispatcher.UIThread.Post(() => _console.LogBuild(line)),
+            line => Avalonia.Threading.Dispatcher.UIThread.Post(() => _console.LogBuild(line)));
+        _console.LogBuild($"--- {exe} exited with {exit} ---");
+        _console.Log($"{exe} {Path.GetFileName(path)} exited with {exit}", exit == 0 ? "OK" : "ERR");
     }
 
     private async Task DotnetAsync(string verb)
@@ -1491,25 +1641,40 @@ public sealed class EditorWindow : Window
             return;
         }
 
-        var csproj = Directory.EnumerateFiles(_projectPath, "*.csproj", SearchOption.AllDirectories)
-            .FirstOrDefault();
+        // Prefer the runnable csproj so `dotnet build` targets the same project as Play.
+        // Falls back to the first .csproj if no Exe was detected (still useful for libs).
+        var csproj = _runnableCsproj ?? Directory.EnumerateFiles(_projectPath, "*.csproj", SearchOption.AllDirectories).FirstOrDefault();
         if (csproj is null)
         {
             _console.Log("No .csproj found in " + _projectPath, "ERR");
             return;
         }
 
-        _console.Log($"dotnet {verb} {csproj}");
+        // Persist every dirty code tab to disk before invoking dotnet — otherwise the
+        // compiler reads stale files and "everything's fine!" while the editor shows
+        // broken code. Tracks saved file count for the log.
+        var savedCount = SaveAllDirtyEditors();
+        if (savedCount > 0) _console.Log($"Saved {savedCount} editor{(savedCount == 1 ? "" : "s")} before build.");
+        // Wipe stale squiggles from the previous build so old errors don't linger after
+        // they've been fixed.
+        ClearAllDiagnostics();
+        _console.Log($"dotnet {verb} {Path.GetFileName(csproj)}");
         _console.ResetBuild();
         _console.FocusBuildTab();
+        // Disable the modern Terminal Logger so MSBuild emits parseable per-line diagnostics
+        // instead of the ANSI/progress-bar pretty output (which our error regex can't read).
+        // -nologo trims the version banner, -v normal makes sure each diagnostic line is
+        // printed, --no-restore is safe because Run does its own restore step.
         var exit = await ProcessRunner.RunAsync(
             "dotnet",
-            $"{verb} \"{csproj}\"",
+            $"{verb} \"{csproj}\" -tl:off -nologo -v minimal",
             _projectPath,
             line => Avalonia.Threading.Dispatcher.UIThread.Post(() => _console.LogBuild(line)),
-            line => Avalonia.Threading.Dispatcher.UIThread.Post(() => _console.LogBuild(line)));
-        _console.LogBuild($"--- dotnet {verb} exited with {exit} ---");
-        _console.Log($"dotnet {verb} exited with {exit}", exit == 0 ? "OK" : "ERR");
+            line => Avalonia.Threading.Dispatcher.UIThread.Post(() => _console.LogBuildError(line)));
+        var (errs, warns) = _console.BuildCounts;
+        _console.LogBuild($"--- dotnet {verb} exited with code {exit}  ({errs} error{(errs == 1 ? "" : "s")}, {warns} warning{(warns == 1 ? "" : "s")}) ---");
+        var status = exit == 0 && errs == 0 ? "OK" : "ERR";
+        _console.Log($"dotnet {verb}: {errs} error(s), {warns} warning(s), exit {exit}", status);
     }
 
     private void OnAssetSelected(ProjectTreeNode node)
@@ -1717,6 +1882,7 @@ public sealed class EditorWindow : Window
         // Debug / build
         yield return new EditorCommand("Build", "Debug", "⌘B", async () => await DotnetAsync("build"));
         yield return new EditorCommand("Run with Live Reload", "Debug", "⌘R", async () => await TogglePlay());
+        yield return new EditorCommand("Run Current File", "Debug", "⌘↩", async () => await RunCurrentFileAsync());
         yield return new EditorCommand("Push Live Reload", "Debug", "⌘E", PushLiveReload);
 
         // Code navigation

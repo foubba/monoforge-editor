@@ -10,12 +10,20 @@ namespace MonoForge.Editor.Views.Panels;
 
 public sealed class ConsolePanel : UserControl
 {
+    // Match MSBuild diagnostic lines like:
+    //   Program.cs(15,9): error CS0103: The name 'foo' does not exist [/path/to/proj.csproj]
+    //   /abs/Program.cs(15): warning CS0168: ...
+    //       1>Program.cs(15,9): error CS0103: ...    (parallel-build node prefix)
+    // Allows leading whitespace + optional `<digits>>` node id (terminal-logger pads them),
+    // optional column, and an optional trailing project hint in square brackets.
     private static readonly Regex BuildMessageRegex = new(
-        @"^(?<path>[^()]+\.[a-zA-Z]+)\((?<line>\d+),(?<col>\d+)\):\s+(?<kind>error|warning)\s+(?<code>[A-Z]+\d+):\s+(?<msg>.+?)\s*(\[.*\])?$",
+        @"^\s*(?:\d+>)?(?<path>[^()]+\.[a-zA-Z]+)\((?<line>\d+)(?:,(?<col>\d+))?\):\s+(?<kind>error|warning)\s+(?<code>[A-Z]+\d+):\s+(?<msg>.+?)\s*(\[.*\])?$",
         RegexOptions.Compiled);
 
     public event Action<string, int>? BuildErrorClicked;
     public event Action<string, int>? TodoClicked;
+    /// <summary>Fires for every recognized build diagnostic line. (path, line, severity, code, message).</summary>
+    public event Action<string, int, string, string, string>? DiagnosticParsed;
 
     private readonly TextBlock _consoleOutput = new();
     private readonly StackPanel _buildList = new() { Spacing = 0, Margin = new Thickness(8, 0, 16, 0) };
@@ -224,6 +232,7 @@ public sealed class ConsolePanel : UserControl
             var msg = match.Groups["msg"].Value;
             if (kind == "error") _buildErrors++;
             else _buildWarnings++;
+            DiagnosticParsed?.Invoke(path, lineNum, kind, code, msg);
 
             var color = kind == "error" ? "#ff6b6b" : "#ffd166";
             var btn = new Button
@@ -268,6 +277,36 @@ public sealed class ConsolePanel : UserControl
         _buildErrors = 0;
         _buildWarnings = 0;
         RebuildTabs();
+    }
+
+    /// <summary>Current build-tab error / warning counts (after parsing diagnostics).</summary>
+    public (int Errors, int Warnings) BuildCounts => (_buildErrors, _buildWarnings);
+
+    /// <summary>
+    /// Same as <see cref="LogBuild"/> but treats unparseable lines as red text so the user
+    /// sees stderr output from `dotnet` (uncaught exceptions, native loader errors, etc.)
+    /// even when the regex doesn't match a known diagnostic format.
+    /// </summary>
+    public void LogBuildError(string line)
+    {
+        var match = BuildMessageRegex.Match(line);
+        if (match.Success)
+        {
+            // Recognized — let LogBuild render the clickable diagnostic button.
+            LogBuild(line);
+            return;
+        }
+        if (string.IsNullOrWhiteSpace(line)) return;
+        _buildList.Children.Add(new TextBlock
+        {
+            Text = line,
+            FontFamily = FontFamily.Parse(MonoFont),
+            FontSize = 11,
+            Foreground = Brush("#ff6b6b"),
+            TextWrapping = TextWrapping.NoWrap,
+            Padding = new Thickness(0, 1)
+        });
+        Avalonia.Threading.Dispatcher.UIThread.Post(() => _buildScroll.ScrollToEnd(), Avalonia.Threading.DispatcherPriority.Background);
     }
 
     public void FocusBuildTab() => SwitchTo("build");

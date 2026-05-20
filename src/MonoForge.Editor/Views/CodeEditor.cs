@@ -25,7 +25,8 @@ public sealed class CodeEditor : UserControl
     private static readonly RegistryOptions Registry = new(ThemeName.DarkPlus);
     private readonly string _filePath;
     private string _language = "plaintext";
-    private string _diagnostics = "";
+    private string _diagnosticsLabel = "";
+    private readonly DiagnosticsRenderer _diagRenderer = new();
     private bool _dirty;
 
     public string FilePath => _filePath;
@@ -54,6 +55,7 @@ public sealed class CodeEditor : UserControl
         _editor.WordWrap = false;
         _editor.TextArea.TextView.BackgroundRenderers.Add(new IndentGuidesRenderer());
         _editor.TextArea.TextView.BackgroundRenderers.Add(new BookmarksRenderer(_bookmarks));
+        _editor.TextArea.TextView.BackgroundRenderers.Add(_diagRenderer);
         _editor.Document = new AvaloniaEdit.Document.TextDocument(content);
         _editor.TextArea.SelectionBrush = new SolidColorBrush(Color.Parse("#264f78"));
         // Alt+drag → rectangle (block) selection — edit multiple lines at the same time
@@ -81,12 +83,12 @@ public sealed class CodeEditor : UserControl
         {
             _installation = _editor.InstallTextMate(Registry);
             ApplyLanguage(filePath);
-            _diagnostics = "tm-ok";
+            _diagnosticsLabel = "tm-ok";
         }
         catch (Exception ex)
         {
             _installation = null;
-            _diagnostics = "tm-fail: " + ex.GetType().Name;
+            _diagnosticsLabel = "tm-fail: " + ex.GetType().Name;
             System.Diagnostics.Debug.WriteLine("TextMate install failed: " + ex);
         }
 
@@ -187,6 +189,29 @@ public sealed class CodeEditor : UserControl
     public string Language => _language;
     public string Text => _editor.Document?.Text ?? "";
 
+    /// <summary>
+    /// Push a fresh set of compiler diagnostics into the renderer + minimap. Called by
+    /// the host (EditorWindow) every time a build/run finishes, replacing whatever was
+    /// shown before. Pass an empty enumerable to clear.
+    /// </summary>
+    public void SetDiagnostics(IEnumerable<DiagnosticInfo> diagnostics)
+    {
+        var list = diagnostics.ToList();
+        _diagRenderer.Set(list);
+        _editor.TextArea.TextView.InvalidateLayer(AvaloniaEdit.Rendering.KnownLayer.Selection);
+        _minimap.SetDiagnosticLines(list.Select(d => (d.Line, d.Severity == "error")));
+    }
+
+    public void ClearDiagnostics() => SetDiagnostics(Array.Empty<DiagnosticInfo>());
+
+    /// <summary>Append a single diagnostic (live-streaming from a running build).</summary>
+    public void AddDiagnostic(DiagnosticInfo diagnostic)
+    {
+        _diagRenderer.Add(diagnostic);
+        _editor.TextArea.TextView.InvalidateLayer(AvaloniaEdit.Rendering.KnownLayer.Selection);
+        _minimap.SetDiagnosticLines(_diagRenderer.Diagnostics.Select(kv => (kv.Key, kv.Value.Severity == "error")));
+    }
+
     private void SelectNextOccurrence()
     {
         if (_editor.Document is null) return;
@@ -283,7 +308,7 @@ public sealed class CodeEditor : UserControl
         }
         catch (Exception ex)
         {
-            _diagnostics = "save-fail: " + ex.Message;
+            _diagnosticsLabel = "save-fail: " + ex.Message;
             UpdateStatus();
             return false;
         }
@@ -385,7 +410,8 @@ public sealed class CodeEditor : UserControl
         }
         else if (IsIndentLanguage(ext))
         {
-            _foldingStrategy = null; // Python-like: brace strategy won't help; skip for now
+            // Python / YAML use indentation; emit nested folds based on leading whitespace.
+            _foldingStrategy = new IndentFoldingStrategy();
         }
 
         UpdateFolding();
@@ -401,6 +427,10 @@ public sealed class CodeEditor : UserControl
         if (_foldingStrategy is BraceFoldingStrategy brace)
         {
             brace.UpdateFoldings(_foldingManager, _editor.Document);
+        }
+        else if (_foldingStrategy is IndentFoldingStrategy indent)
+        {
+            indent.UpdateFoldings(_foldingManager, _editor.Document);
         }
     }
 
@@ -422,7 +452,7 @@ public sealed class CodeEditor : UserControl
         {
             _language = def.Id;
             try { _installation.SetGrammar(Registry.GetScopeByLanguageId(def.Id)); }
-            catch (Exception ex) { _diagnostics = "grammar-fail: " + ex.GetType().Name; }
+            catch (Exception ex) { _diagnosticsLabel = "grammar-fail: " + ex.GetType().Name; }
         }
         else
         {
@@ -436,9 +466,27 @@ public sealed class CodeEditor : UserControl
         var caret = _editor.TextArea.Caret;
         var len = _editor.Document?.TextLength ?? 0;
         var dirtyMark = _dirty ? " ●" : "";
-        var diag = string.IsNullOrEmpty(_diagnostics) ? "" : "    " + _diagnostics;
-        _status.Text = $"{_language}    Ln {caret.Line}, Col {caret.Column}    {len} chars{dirtyMark}{diag}";
+        var diag = string.IsNullOrEmpty(_diagnosticsLabel) ? "" : "    " + _diagnosticsLabel;
+        _status.Text = $"{PrettyLanguageName(_language)}    Ln {caret.Line}, Col {caret.Column}    {len} chars{dirtyMark}{diag}";
     }
+
+    /// <summary>Capitalize and prettify TextMate language ids for the status bar.</summary>
+    private static string PrettyLanguageName(string id) => id switch
+    {
+        "csharp" => "C#",
+        "cpp" => "C++",
+        "javascript" => "JavaScript",
+        "typescript" => "TypeScript",
+        "python" => "Python",
+        "json" => "JSON",
+        "yaml" => "YAML",
+        "xml" => "XML",
+        "html" => "HTML",
+        "css" => "CSS",
+        "markdown" => "Markdown",
+        "plaintext" or "" => "Plain Text",
+        _ => char.ToUpper(id[0]) + id[1..],
+    };
 }
 
 /// <summary>
@@ -483,5 +531,71 @@ internal sealed class BraceFoldingStrategy
 
         newFoldings.Sort((a, b) => a.StartOffset.CompareTo(b.StartOffset));
         return newFoldings;
+    }
+}
+
+/// <summary>
+/// Indent-based folding for Python / YAML. Each block of consecutive lines whose indent
+/// is strictly deeper than the line above becomes a fold. Blank lines are skipped when
+/// determining block boundaries so trailing blank lines don't accidentally close a block.
+/// </summary>
+internal sealed class IndentFoldingStrategy
+{
+    public void UpdateFoldings(FoldingManager manager, AvaloniaEdit.Document.TextDocument document)
+    {
+        var newFoldings = new List<NewFolding>();
+        // Each entry: (the line that opened this block, its indent, its end offset).
+        var open = new Stack<(int Line, int Indent, int StartOffset)>();
+
+        for (var lineNum = 1; lineNum <= document.LineCount; lineNum++)
+        {
+            var line = document.GetLineByNumber(lineNum);
+            var text = document.GetText(line);
+            if (string.IsNullOrWhiteSpace(text)) continue;
+
+            var indent = 0;
+            while (indent < text.Length && (text[indent] == ' ' || text[indent] == '\t')) indent++;
+
+            // Any open block whose start-line has indent >= current ends just before this line.
+            while (open.Count > 0 && open.Peek().Indent >= indent)
+            {
+                var top = open.Pop();
+                var endLineNum = FindPrevNonBlank(document, lineNum - 1, top.Line + 1);
+                if (endLineNum > top.Line)
+                {
+                    var endLine = document.GetLineByNumber(endLineNum);
+                    if (endLine.EndOffset > top.StartOffset)
+                        newFoldings.Add(new NewFolding(top.StartOffset, endLine.EndOffset));
+                }
+            }
+
+            open.Push((lineNum, indent, line.EndOffset));
+        }
+
+        // Close anything still on the stack at end-of-document.
+        while (open.Count > 0)
+        {
+            var top = open.Pop();
+            var endLineNum = FindPrevNonBlank(document, document.LineCount, top.Line + 1);
+            if (endLineNum > top.Line)
+            {
+                var endLine = document.GetLineByNumber(endLineNum);
+                if (endLine.EndOffset > top.StartOffset)
+                    newFoldings.Add(new NewFolding(top.StartOffset, endLine.EndOffset));
+            }
+        }
+
+        newFoldings.Sort((a, b) => a.StartOffset.CompareTo(b.StartOffset));
+        manager.UpdateFoldings(newFoldings, -1);
+    }
+
+    private static int FindPrevNonBlank(AvaloniaEdit.Document.TextDocument doc, int from, int min)
+    {
+        for (var k = from; k >= min; k--)
+        {
+            var l = doc.GetLineByNumber(k);
+            if (!string.IsNullOrWhiteSpace(doc.GetText(l))) return k;
+        }
+        return -1;
     }
 }

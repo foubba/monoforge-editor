@@ -116,6 +116,10 @@ public sealed class DocumentTabHost : UserControl
 
     public Control? ActiveContent => _active?.Content;
 
+    /// <summary>Enumerate every open tab's content control. Used by callers that need
+    /// to do something across all tabs (e.g. save-all before build).</summary>
+    public IEnumerable<Control> OpenContents => _documents.Select(d => d.Content);
+
     public void SetDirty(string key, bool dirty)
     {
         var doc = _documents.FirstOrDefault(d => d.Key == key);

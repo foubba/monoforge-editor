@@ -64,9 +64,15 @@ internal static class AssetIcon
             return true;
         }
 
+        // .NET/MonoGame project plumbing (.csproj, .sln, .props…) and common config / data
+        // formats are XML-ish or plain text. Treat them as code so they open in the editor
+        // with the right syntax highlighter rather than the "no preview" message.
         return IsCodeLike(name, extension)
             || extension is ".json" or ".xml" or ".txt" or ".md" or ".mgcb" or ".fx" or ".fxc"
-                or ".fp" or ".vp" or ".script" or ".material" or ".atlas" or ".collection";
+                or ".fp" or ".vp" or ".script" or ".material" or ".atlas" or ".collection"
+                or ".csproj" or ".fsproj" or ".vbproj" or ".sln" or ".props" or ".targets"
+                or ".config" or ".editorconfig" or ".gitignore" or ".gitattributes"
+                or ".yml" or ".yaml" or ".toml" or ".ini" or ".env";
     }
 
     public static bool IsCodeLike(string name, string extension)

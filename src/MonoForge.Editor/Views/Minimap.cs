@@ -27,7 +27,13 @@ public sealed class Minimap : Border
         _canvas = new MinimapCanvas(editor);
         Child = _canvas;
 
-        _editor.TextChanged += (_, _) => _canvas.InvalidateVisual();
+        // Diagnostic markers on the right edge of the minimap. Cleared when the document
+        // is edited so old build errors disappear once the user starts fixing them.
+        _editor.TextChanged += (_, _) =>
+        {
+            _canvas.ClearDiagnosticLines();
+            _canvas.InvalidateVisual();
+        };
         _editor.TextArea.TextView.ScrollOffsetChanged += (_, _) => _canvas.InvalidateVisual();
         _editor.TextArea.TextView.LayoutUpdated += (_, _) => _canvas.InvalidateVisual();
 
@@ -36,6 +42,16 @@ public sealed class Minimap : Border
         AddHandler(PointerMovedEvent, OnMinimapMoved, RoutingStrategies.Tunnel | RoutingStrategies.Bubble, handledEventsToo: true);
         AddHandler(PointerReleasedEvent, OnMinimapReleased, RoutingStrategies.Tunnel | RoutingStrategies.Bubble, handledEventsToo: true);
         AddHandler(PointerWheelChangedEvent, OnMinimapWheel, RoutingStrategies.Tunnel | RoutingStrategies.Bubble, handledEventsToo: true);
+    }
+
+    /// <summary>
+    /// Highlight given document line numbers as error/warning bars on the minimap. Used
+    /// to surface compile diagnostics across the whole file (the bars are clickable via
+    /// the same drag-to-scroll behavior — clicking a bar jumps the viewport there).
+    /// </summary>
+    public void SetDiagnosticLines(IEnumerable<(int Line, bool IsError)> lines)
+    {
+        _canvas.SetDiagnosticLines(lines);
     }
 
     private void OnMinimapPressed(object? sender, PointerPressedEventArgs e)
@@ -105,11 +121,30 @@ internal sealed class MinimapCanvas : Control
     public const double FontPx = 3.0;
     public const double LineHeight = 3.6;
     private const int MaxCharsPerLine = 140;
+    // Line number → IsError. Drawn as small colored bars on the minimap's right edge.
+    private readonly Dictionary<int, bool> _diagLines = new();
 
     public MinimapCanvas(TextEditor editor)
     {
         _editor = editor;
         IsHitTestVisible = false;
+    }
+
+    public void SetDiagnosticLines(IEnumerable<(int Line, bool IsError)> lines)
+    {
+        _diagLines.Clear();
+        foreach (var (line, isErr) in lines)
+        {
+            if (_diagLines.TryGetValue(line, out var existing) && existing && !isErr) continue;
+            _diagLines[line] = isErr;
+        }
+        InvalidateVisual();
+    }
+
+    public void ClearDiagnosticLines()
+    {
+        if (_diagLines.Count == 0) return;
+        _diagLines.Clear();
     }
 
     public (double top, double height) GetViewportRect()
@@ -202,6 +237,24 @@ internal sealed class MinimapCanvas : Control
             var viewport = new Rect(0, vpTop, bounds.Width, vpHeight);
             context.FillRectangle(BrushOf("#22ffffff"), viewport);
             context.DrawRectangle(new Pen(BrushOf("#44ffffff"), 1), viewport);
+        }
+
+        // Diagnostic markers — small colored bars on the right edge so the user can see
+        // at-a-glance where errors are even if they're scrolled off-screen.
+        if (_diagLines.Count > 0)
+        {
+            var errBrush = BrushOf("#ff6b6b");
+            var warnBrush = BrushOf("#ffd166");
+            const double barWidth = 4;
+            const double barHeight = 2.5;
+            var x = bounds.Width - barWidth - 1;
+            foreach (var (line, isErr) in _diagLines)
+            {
+                if (line < 1 || line > totalLines) continue;
+                var y = (line - 1) * step;
+                if (y > bounds.Height) continue;
+                context.FillRectangle(isErr ? errBrush : warnBrush, new Rect(x, y, barWidth, barHeight));
+            }
         }
     }
 
