@@ -61,7 +61,13 @@ public sealed class Minimap : Border
         _dragging = true;
 
         var (vpTop, vpHeight) = _canvas.GetViewportRect();
-        if (y >= vpTop && y <= vpTop + vpHeight)
+        // For SHORT files the entire document already fits in the viewport, so vpHeight
+        // covers (almost) the whole minimap and the "inside viewport" branch would never
+        // scroll *or* jump — click felt like a no-op. Treat clicks outside the visible
+        // viewport AND clicks on short documents (no scrolling possible) as a jump so the
+        // minimap is always useful for navigation.
+        var canScroll = vpHeight + 2 < Bounds.Height; // small slack to absorb rounding
+        if (canScroll && y >= vpTop && y <= vpTop + vpHeight)
         {
             _dragOffsetInViewport = y - vpTop;
         }
@@ -70,6 +76,10 @@ public sealed class Minimap : Border
             _dragOffsetInViewport = vpHeight / 2;
             ScrollFromMinimapY(y);
         }
+        // Always move the caret too — the user just told us where they want to be, even
+        // if there's no scrolling needed (short files). Position cursor at column 1 of
+        // the clicked line.
+        JumpCaretToMinimapY(y);
         e.Handled = true;
     }
 
@@ -81,8 +91,30 @@ public sealed class Minimap : Border
             _dragging = false;
             return;
         }
-        ScrollFromMinimapY(e.GetPosition(this).Y);
+        var y = e.GetPosition(this).Y;
+        ScrollFromMinimapY(y);
+        JumpCaretToMinimapY(y);
         e.Handled = true;
+    }
+
+    /// <summary>
+    /// Map a Y coordinate inside the minimap to a document line and move the caret
+    /// there. Used in addition to (not instead of) ScrollFromMinimapY so the editor
+    /// follows the click even when the document is too short to actually scroll.
+    /// </summary>
+    private void JumpCaretToMinimapY(double y)
+    {
+        var doc = _editor.Document;
+        if (doc is null || doc.LineCount == 0) return;
+        var totalLines = doc.LineCount;
+        var fullHeight = totalLines * MinimapCanvas.LineHeight;
+        var minimapDocHeight = Math.Min(fullHeight, Bounds.Height);
+        if (minimapDocHeight <= 0) return;
+        var ratio = Math.Clamp(y / minimapDocHeight, 0.0, 1.0);
+        var line = Math.Clamp((int)Math.Round(ratio * (totalLines - 1)) + 1, 1, totalLines);
+        _editor.TextArea.Caret.Line = line;
+        _editor.TextArea.Caret.Column = 1;
+        _editor.TextArea.Caret.BringCaretToView();
     }
 
     private void OnMinimapReleased(object? sender, PointerReleasedEventArgs e)

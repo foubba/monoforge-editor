@@ -12,6 +12,13 @@ public sealed class ProjectWorkspace
     public bool ShowGrid { get; set; } = true;
     public bool SnapToGrid { get; set; } = true;
     public SceneDocument? Scene { get; set; }
+    /// <summary>Document-tab keys (file paths, or the special "__scene__" sentinel) that
+    /// were open at the time the workspace was last saved. Persisted so the editor reopens
+    /// the same files on the next launch — Defold / VS Code / Cursor all behave this way
+    /// and losing tabs across restarts is one of the most annoying parts of bespoke editors.</summary>
+    public List<string> OpenTabs { get; set; } = new();
+    /// <summary>The key of the tab that was focused when the workspace was saved.</summary>
+    public string ActiveTabKey { get; set; } = "";
 
     public const string FileName = "monoforge.json";
 

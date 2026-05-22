@@ -43,6 +43,19 @@ internal static class AssetViewers
             return new Model3DViewer(node.FullPath);
         }
 
+        if (extension == ".mfmap")
+        {
+            try
+            {
+                var doc = MonoForge.Editor.Services.MapJson.Load(node.FullPath);
+                return new MapEditor(node.FullPath, doc);
+            }
+            catch (Exception ex)
+            {
+                return Message("Could not load map", ex.Message);
+            }
+        }
+
         if (extension == ".json" && IsAtlasJson(node.FullPath))
         {
             return new AtlasBrowser(node.FullPath);

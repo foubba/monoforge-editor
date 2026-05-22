@@ -120,6 +120,10 @@ public sealed class DocumentTabHost : UserControl
     /// to do something across all tabs (e.g. save-all before build).</summary>
     public IEnumerable<Control> OpenContents => _documents.Select(d => d.Content);
 
+    /// <summary>Snapshot of every open tab's key in left-to-right order. Used by the
+    /// workspace persistence layer to reopen the same tabs across editor restarts.</summary>
+    public IEnumerable<string> OpenKeys => _documents.Select(d => d.Key).ToList();
+
     public void SetDirty(string key, bool dirty)
     {
         var doc = _documents.FirstOrDefault(d => d.Key == key);

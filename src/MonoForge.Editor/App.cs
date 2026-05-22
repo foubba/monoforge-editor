@@ -27,6 +27,10 @@ public sealed class App : Application
 
     public override void OnFrameworkInitializationCompleted()
     {
+        // Replace the generic .NET document icon shown in the macOS Dock with our logo.
+        // No-op on Windows / Linux. Window.Icon already handles those.
+        AppIcon.TryApplyMacDockIcon();
+
         if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
         {
             desktop.MainWindow = new EditorWindow();

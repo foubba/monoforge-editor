@@ -92,15 +92,53 @@ public sealed class MonoForgeLogo : Control
         return geometry;
     }
 
-    /// <summary>Render the logo into an off-screen bitmap. Used as the window icon.</summary>
+    /// <summary>Render the logo into an off-screen bitmap. Used as the window /
+    /// dock icon. Matches the macOS "squircle" convention: a translucent gray
+    /// rounded-rect background with the light-palette mark centered inside, so
+    /// the icon sits in harmony with other Big Sur+ dock icons. Outside the
+    /// rounded rect the bitmap is fully transparent.</summary>
     public static Bitmap RenderToBitmap(int pixelSize)
     {
         var size = new PixelSize(pixelSize, pixelSize);
         var dpi = new Vector(96, 96);
         var rtb = new RenderTargetBitmap(size, dpi);
         using var ctx = rtb.CreateDrawingContext();
-        ctx.DrawRectangle(Brush.Parse("#1f2427"), null, new Rect(0, 0, pixelSize, pixelSize));
-        Draw(ctx, new Rect(0, 0, pixelSize, pixelSize), pixelSize / 48.0);
+
+        // Squircle background — corner radius ≈ 22% of side, the macOS Big Sur ratio.
+        var inset = pixelSize * 0.06;
+        var rect = new Rect(inset, inset, pixelSize - inset * 2, pixelSize - inset * 2);
+        var radius = rect.Width * 0.22;
+        var rrect = new RoundedRect(rect, radius);
+
+        // Translucent dark gray base — lets whatever's behind the dock show through
+        // slightly, like a frosted glass cell.
+        var bgBrush = Brush.Parse("#aa2a2e33");
+        ctx.DrawRectangle(bgBrush, null, rrect);
+
+        // Diagonal sheen: a soft brighter band running top-left → bottom-right that
+        // gives the icon a subtle "light from above" feel. Layered ON TOP of the
+        // base so it lifts the upper half without washing out the whole rect.
+        var sheen = new LinearGradientBrush
+        {
+            StartPoint = new RelativePoint(0, 0, RelativeUnit.Relative),
+            EndPoint = new RelativePoint(1, 1, RelativeUnit.Relative),
+            GradientStops =
+            {
+                new GradientStop(Color.Parse("#33ffffff"), 0.0),
+                new GradientStop(Color.Parse("#11ffffff"), 0.5),
+                new GradientStop(Color.Parse("#00ffffff"), 1.0),
+            },
+        };
+        ctx.DrawRectangle(sheen, null, rrect);
+
+        // Light-gray border to lift the icon off dark dock backgrounds.
+        var borderPen = new Pen(Brush.Parse("#88c5ccd6"), Math.Max(1.5, pixelSize * 0.012));
+        ctx.DrawRectangle(null, borderPen, rrect);
+
+        // Mark sized to ~60% of the icon side so it fills the squircle the way
+        // other app icons do (Finder, App Store all use roughly this margin).
+        var markBox = new Rect(0, 0, pixelSize, pixelSize).Inflate(-pixelSize * 0.2);
+        Draw(ctx, markBox, markBox.Width / 48.0, light: true);
         return rtb;
     }
 }

@@ -19,16 +19,21 @@ public sealed class EditorWindow : Window
     private readonly AssetsPanel _assets = new();
     private readonly OutlinePanel _outline = new();
     private readonly InspectorPanel _inspector = new();
-    private readonly ContentControl _rightDockHost = new();
+    private readonly ContentControl _rightDockHost = new() { IsVisible = false };
     private readonly Panels.LayersPanel _layers = new();
     private Control? _sceneDock; // cached scene-specific right dock (Outline+Inspector+Layers+SpritePane)
     private Grid? _workspaceGrid;
+    private Control? _centerControl; // cached center column control; re-added when layout rebuilds
     private Control? _toolbar; // scene-tool toolbar (Select/Move/Snap/Group/Align/...) — hidden for non-scene tabs
     private readonly Panels.AiAssistantPanel _aiPanel = new();
     // Sidebar is visible by default so the user sees the Install/Auth path without
     // having to discover the ⌘⇧A shortcut first.
     private bool _aiPanelVisible = true;
-    private bool _dockVisible = true;
+    // Start hidden — the dock is only meaningful when a scene/GLB tab is active, and at
+    // launch there's no active tab, so we don't reserve space for an empty panel.
+    private bool _dockVisible = false;
+    private bool _dockUserVisible = true;
+    private bool _dockContextRelevant = false;
     private readonly Panels.StatisticsPanel _stats = new();
     private readonly ConsolePanel _console = new();
     private readonly DocumentTabHost _tabs = new();
@@ -57,7 +62,7 @@ public sealed class EditorWindow : Window
         _sceneCanvas.SnapToGrid = settings.SnapToGridDefault;
 
         Title = "MonoForge 0.2";
-        try { Icon = new WindowIcon(MonoForgeLogo.RenderToBitmap(64)); } catch { /* icon is decorative */ }
+        AppIcon.Apply(this);
         Width = 1510;
         Height = 824;
         MinWidth = 1080;
@@ -100,7 +105,14 @@ public sealed class EditorWindow : Window
         root.Children.Add(BuildMenuBar().At(row: 0));
         _toolbar = BuildToolbar();
         root.Children.Add(_toolbar.At(row: 1));
-        root.Children.Add(BuildWorkspace().At(row: 2));
+        // Wrap the workspace in a Panel so the toast host can sit on top of it without
+        // taking up layout space. Toasts ignore hit-testing so they don't block clicks.
+        var workspacePanel = new Panel();
+        workspacePanel.Children.Add(BuildWorkspace());
+        var toastHost = new ToastHost();
+        toastHost.AttachAsActive();
+        workspacePanel.Children.Add(toastHost);
+        root.Children.Add(workspacePanel.At(row: 2));
         root.Children.Add(BuildStatusBar().At(row: 3));
         return root;
     }
@@ -193,6 +205,14 @@ public sealed class EditorWindow : Window
         openSceneTab.Click += (_, _) => OpenSceneTab();
         file.Items.Add(openSceneTab);
 
+        var newMap = new MenuItem { Header = "New 3D Map..." };
+        newMap.Click += async (_, _) => await NewMapAsync();
+        file.Items.Add(newMap);
+
+        var openMap = new MenuItem { Header = "Open Map..." };
+        openMap.Click += async (_, _) => await OpenMapAsync();
+        file.Items.Add(openMap);
+
         var saveScene = new MenuItem { Header = "Save Scene...   ⌘S" };
         saveScene.Click += async (_, _) => await SaveSceneAsync();
         file.Items.Add(saveScene);
@@ -256,23 +276,25 @@ public sealed class EditorWindow : Window
 
     private async Task OpenProjectFromPath(string path)
     {
+        using var task = Services.BackgroundTasks.Begin("Opening project");
+        task.Update(Path.GetFileName(path));
         _projectPath = path;
         Title = $"{Path.GetFileName(path)} - MonoForge 0.2";
-        _assets.LoadProject(path);
-        // Try to identify the runnable .csproj so Play knows what to launch. The button
-        // only enables if we actually found something with OutputType=Exe (or WinExe).
-        _runnableCsproj = FindRunnableCsproj(path);
+        _console.Log("Opening project: " + path);
         _aiPanel.ProjectPath = path;
+        task.Update("Loading asset tree");
+        _assets.LoadProject(path);
+        task.Update("Scanning for runnable .csproj");
+        _runnableCsproj = await Task.Run(() => FindRunnableCsproj(path));
         if (_runButton is not null) _runButton.IsEnabled = _runnableCsproj is not null;
         if (_runnableCsproj is not null)
             _console.Log("Runnable project detected: " + Path.GetRelativePath(path, _runnableCsproj), "OK");
         else
             _console.Log("No runnable .csproj found (no <OutputType>Exe</OutputType>). Play stays disabled.", "WARN");
-        _console.Log("Opened project: " + path);
+        task.Update("Restoring workspace");
         LoadWorkspace(path);
         Services.UserSettings.Current.PushRecentProject(path);
         UpdateStatus();
-        await Task.CompletedTask;
     }
 
     private MenuItem BuildEditMenu()
@@ -325,8 +347,14 @@ public sealed class EditorWindow : Window
             _sceneCanvas.SnapToObjects = !_sceneCanvas.SnapToObjects;
             _console.Log("Snap to objects: " + (_sceneCanvas.SnapToObjects ? "on" : "off"));
         };
-        // Panel-visibility toggles. The header text reflects current state so the user
-        // can tell what hitting it will do without having to hover/check the layout.
+        // Panel-visibility toggles. Header text reflects current state so the user can
+        // tell what hitting it will do without having to hover/check the layout.
+        var dockToggle = new MenuItem { Header = _dockUserVisible ? "Hide Properties Panel   ⌘⇧I" : "Show Properties Panel   ⌘⇧I" };
+        dockToggle.Click += (_, _) =>
+        {
+            ToggleRightDock();
+            dockToggle.Header = _dockUserVisible ? "Hide Properties Panel   ⌘⇧I" : "Show Properties Panel   ⌘⇧I";
+        };
         var aiToggle = new MenuItem { Header = _aiPanelVisible ? "Hide AI Sidebar   ⌘⇧A" : "Show AI Sidebar   ⌘⇧A" };
         aiToggle.Click += (_, _) =>
         {
@@ -337,6 +365,7 @@ public sealed class EditorWindow : Window
         view.Items.Add(new Separator());
         view.Items.Add(grid); view.Items.Add(snap); view.Items.Add(snapToObj); view.Items.Add(pixel);
         view.Items.Add(new Separator());
+        view.Items.Add(dockToggle);
         view.Items.Add(aiToggle);
         return view;
     }
@@ -474,74 +503,125 @@ public sealed class EditorWindow : Window
         return bar;
     }
 
+    // Cached layout pieces. We rebuild the workspace grid every time the dock or AI
+    // panel toggles so the hidden panels don't even *exist* as zero-width columns —
+    // a single empty column with width 0 was still painting background + intercepting
+    // drag through the AI resize handle, which the user repeatedly reported as a
+    // ghost panel hanging behind the AI sidebar.
+    private Control? _aiResizeHandle;
+    private double _rightDockWidth = 282;
+    private double _aiPanelWidth = 360;
+    // Track which grid column the dock / AI panel currently live in. The indices
+    // shift when the dock is absent, so the resize handle needs to look them up at
+    // drag time rather than hardcoding column 4 / 6.
+    private int _dockColumnIndex = -1;
+    private int _aiColumnIndex = -1;
+
     private Control BuildWorkspace()
     {
-        // Columns: assets | split | center | split | rightDock | split | AiSidebar.
-        // Widths for the right dock and the AI sidebar are toggled at runtime; the AI
-        // sidebar starts collapsed (0px), opens to ~360px when the user hits ⌘⇧A.
-        var grid = new Grid
-        {
-            ColumnDefinitions = new ColumnDefinitions(ComposeWorkspaceColumns()),
-            Background = Brush(EditorBackground)
-        };
-
-        grid.Children.Add(_assets.At(column: 0));
-        grid.Children.Add(VSplitter().At(column: 1));
-        grid.Children.Add(BuildCenter().At(column: 2));
-        grid.Children.Add(VSplitter().At(column: 3));
-        grid.Children.Add(BuildRightDock().At(column: 4));
-        // Custom drag handle for the AI panel left edge. Avalonia's GridSplitter doesn't
-        // reliably resize the last column when it sits between two Pixel widths plus a
-        // Star center column; this handle pushes width changes directly into both
-        // adjacent pixel columns so growing the AI panel always works.
-        grid.Children.Add(BuildAiResizeHandle().At(column: 5));
-        grid.Children.Add(_aiPanel.At(column: 6));
+        var grid = new Grid { Background = Brush(EditorBackground) };
+        _workspaceGrid = grid;
+        _centerControl = BuildCenter();
+        _aiResizeHandle = BuildAiResizeHandle();
         _aiPanel.ProjectMutated += () =>
         {
             if (_projectPath is not null) _assets.LoadProject(_projectPath);
         };
-        _workspaceGrid = grid;
-        ApplyWorkspaceMinimums();
+        RebuildWorkspaceLayout();
         return grid;
     }
 
-    /// <summary>Apply minimum widths to each workspace column so a splitter drag can't
-    /// collapse panels to zero and panels can always be grown back.</summary>
-    private void ApplyWorkspaceMinimums()
+    /// <summary>
+    /// Rebuild the workspace grid's columns and children from scratch based on the
+    /// current dock / AI visibility flags. Hidden panels are NOT added at all (no
+    /// zero-width placeholder columns) so they can't paint background or interfere
+    /// with hit testing on neighboring controls.
+    /// </summary>
+    private void RebuildWorkspaceLayout()
     {
-        if (_workspaceGrid is null || _workspaceGrid.ColumnDefinitions.Count < 7) return;
-        _workspaceGrid.ColumnDefinitions[0].MinWidth = 180; // assets
-        _workspaceGrid.ColumnDefinitions[2].MinWidth = 300; // center editor
-        if (_dockVisible) _workspaceGrid.ColumnDefinitions[4].MinWidth = 220;
-        if (_aiPanelVisible) _workspaceGrid.ColumnDefinitions[6].MinWidth = 240;
-    }
+        if (_workspaceGrid is null || _centerControl is null || _aiResizeHandle is null) return;
 
-    /// <summary>Compose the workspace ColumnDefinitions spec from the two visibility flags.</summary>
-    private string ComposeWorkspaceColumns()
-    {
-        // 6px splitters match VSplitter().Width — narrower splitters were hard to grab.
-        var dock = _dockVisible ? "6,282" : "0,0";
-        var ai = _aiPanelVisible ? "6,360" : "0,0";
-        return $"266,6,*,{dock},{ai}";
-    }
+        // Detach everything so we can re-add with new column indices.
+        _workspaceGrid.Children.Clear();
+        _workspaceGrid.ColumnDefinitions.Clear();
 
-    private void RefreshWorkspaceColumns()
-    {
-        if (_workspaceGrid is null) return;
-        var spec = ComposeWorkspaceColumns();
-        if (_workspaceGrid.ColumnDefinitions.ToString() != spec)
+        var dockOn = _dockContextRelevant && _dockUserVisible;
+        var aiOn = _aiPanelVisible;
+
+        // Build the column list dynamically.
+        _workspaceGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(266), MinWidth = 180 }); // 0: assets
+        _workspaceGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(6) });                   // 1: splitter
+        _workspaceGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star), MinWidth = 300 }); // 2: center
+
+        _dockColumnIndex = -1;
+        _aiColumnIndex = -1;
+
+        if (dockOn)
         {
-            _workspaceGrid.ColumnDefinitions = new ColumnDefinitions(spec);
-            ApplyWorkspaceMinimums();
+            _workspaceGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(6) });
+            _workspaceGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(_rightDockWidth), MinWidth = 220 });
+            _dockColumnIndex = _workspaceGrid.ColumnDefinitions.Count - 1;
         }
+        if (aiOn)
+        {
+            _workspaceGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(6) }); // ai resize handle
+            var handleIdx = _workspaceGrid.ColumnDefinitions.Count - 1;
+            _workspaceGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(_aiPanelWidth), MinWidth = 240 });
+            _aiColumnIndex = _workspaceGrid.ColumnDefinitions.Count - 1;
+
+            _workspaceGrid.Children.Add(_assets.At(column: 0));
+            _workspaceGrid.Children.Add(VSplitter().At(column: 1));
+            _workspaceGrid.Children.Add(_centerControl.At(column: 2));
+            if (_dockColumnIndex > 0)
+            {
+                _workspaceGrid.Children.Add(VSplitter().At(column: _dockColumnIndex - 1));
+                _workspaceGrid.Children.Add(_rightDockHost.At(column: _dockColumnIndex));
+                _rightDockHost.IsVisible = true;
+            }
+            else _rightDockHost.IsVisible = false;
+            _workspaceGrid.Children.Add(_aiResizeHandle.At(column: handleIdx));
+            _workspaceGrid.Children.Add(_aiPanel.At(column: _aiColumnIndex));
+        }
+        else
+        {
+            _workspaceGrid.Children.Add(_assets.At(column: 0));
+            _workspaceGrid.Children.Add(VSplitter().At(column: 1));
+            _workspaceGrid.Children.Add(_centerControl.At(column: 2));
+            if (_dockColumnIndex > 0)
+            {
+                _workspaceGrid.Children.Add(VSplitter().At(column: _dockColumnIndex - 1));
+                _workspaceGrid.Children.Add(_rightDockHost.At(column: _dockColumnIndex));
+                _rightDockHost.IsVisible = true;
+            }
+            else _rightDockHost.IsVisible = false;
+        }
+
+        _dockVisible = dockOn;
     }
 
     /// <summary>Open / close the right-edge Claude sidebar (Cursor-style).</summary>
     private void ToggleAiPanel()
     {
+        CaptureLiveColumnWidths();
         _aiPanelVisible = !_aiPanelVisible;
-        RefreshWorkspaceColumns();
+        RebuildWorkspaceLayout();
         if (_aiPanelVisible) _aiPanel.Focus();
+    }
+
+    /// <summary>Snapshot the live dock / AI widths so the user's drag-resize sticks across a rebuild.</summary>
+    private void CaptureLiveColumnWidths()
+    {
+        if (_workspaceGrid is null) return;
+        if (_dockColumnIndex >= 0 && _dockColumnIndex < _workspaceGrid.ColumnDefinitions.Count)
+        {
+            var w = _workspaceGrid.ColumnDefinitions[_dockColumnIndex].ActualWidth;
+            if (w > 0) _rightDockWidth = w;
+        }
+        if (_aiColumnIndex >= 0 && _aiColumnIndex < _workspaceGrid.ColumnDefinitions.Count)
+        {
+            var w = _workspaceGrid.ColumnDefinitions[_aiColumnIndex].ActualWidth;
+            if (w > 0) _aiPanelWidth = w;
+        }
     }
 
     private Control BuildCenter()
@@ -577,26 +657,46 @@ public sealed class EditorWindow : Window
         {
             _sceneDock ??= BuildSceneDock();
             _rightDockHost.Content = _sceneDock;
-            SetWorkspaceDockVisible(true);
+            _dockContextRelevant = true;
         }
         else if (active is Model3DViewer viewer)
         {
             _rightDockHost.Content = BorderBox(viewer.BuildContextPanel(), BorderSubtle, 1, 0, 0, 0);
-            SetWorkspaceDockVisible(true);
+            _dockContextRelevant = true;
         }
         else
         {
-            // null (no tabs) or code editor / other → no contextual panel; collapse.
+            // null (no tabs) or code editor / other → nothing scene-specific to show.
             _rightDockHost.Content = null;
-            SetWorkspaceDockVisible(false);
+            _dockContextRelevant = false;
         }
+        ApplyDockVisibility();
     }
 
+    /// <summary>Effective right-dock visibility = the context has something relevant
+    /// AND the user hasn't explicitly hidden the panel via View / ⌘⇧I. We toggle the
+    /// host's IsVisible in addition to collapsing the column width so the panel can't
+    /// leak any drawn background or interfere with hit testing on the AI handle.</summary>
+    private void ApplyDockVisibility()
+    {
+        var effective = _dockContextRelevant && _dockUserVisible;
+        if (_dockVisible == effective) return;
+        CaptureLiveColumnWidths();
+        RebuildWorkspaceLayout();
+    }
+
+    /// <summary>Toggle the user-controlled right-dock visibility (View menu / ⌘⇧I).</summary>
+    private void ToggleRightDock()
+    {
+        _dockUserVisible = !_dockUserVisible;
+        ApplyDockVisibility();
+    }
+
+    /// <summary>Legacy entry point used elsewhere — defer to ApplyDockVisibility through the context flag.</summary>
     private void SetWorkspaceDockVisible(bool visible)
     {
-        if (_dockVisible == visible) return;
-        _dockVisible = visible;
-        RefreshWorkspaceColumns();
+        _dockContextRelevant = visible;
+        ApplyDockVisibility();
     }
 
     /// <summary>Right dock layout used while a sprite scene tab is active.</summary>
@@ -654,10 +754,10 @@ public sealed class EditorWindow : Window
 
         handle.PointerPressed += (_, e) =>
         {
-            if (_workspaceGrid is null) return;
+            if (_workspaceGrid is null || _aiColumnIndex < 0) return;
             startX = e.GetPosition(_workspaceGrid).X;
-            startRightDock = _workspaceGrid.ColumnDefinitions[4].ActualWidth;
-            startAi = _workspaceGrid.ColumnDefinitions[6].ActualWidth;
+            startRightDock = _dockColumnIndex >= 0 ? _workspaceGrid.ColumnDefinitions[_dockColumnIndex].ActualWidth : 0;
+            startAi = _workspaceGrid.ColumnDefinitions[_aiColumnIndex].ActualWidth;
             dragging = true;
             e.Pointer.Capture(handle);
             handle.Background = Brush(Accent);
@@ -665,22 +765,26 @@ public sealed class EditorWindow : Window
 
         handle.PointerMoved += (_, e) =>
         {
-            if (!dragging || _workspaceGrid is null) return;
+            if (!dragging || _workspaceGrid is null || _aiColumnIndex < 0) return;
             // Positive delta = mouse moved left = AI panel grows.
             var delta = startX - e.GetPosition(_workspaceGrid).X;
             const double aiMin = 240;
             const double rightDockMin = 180;
             var newAi = Math.Max(aiMin, startAi + delta);
-            // Distribute width changes: shrink right dock to feed AI (with floor), and
-            // vice versa when growing right dock back.
-            var aiDelta = newAi - startAi;
-            var newRightDock = Math.Max(rightDockMin, startRightDock - aiDelta);
-            // If right dock hit its floor, clamp AI growth so we don't overflow.
-            var actualRightDockShrink = startRightDock - newRightDock;
-            newAi = startAi + actualRightDockShrink;
 
-            _workspaceGrid.ColumnDefinitions[4].Width = new GridLength(newRightDock);
-            _workspaceGrid.ColumnDefinitions[6].Width = new GridLength(newAi);
+            if (_dockColumnIndex >= 0)
+            {
+                // Dock is present — borrow from it to feed AI growth (and vice versa).
+                var aiDelta = newAi - startAi;
+                var newRightDock = Math.Max(rightDockMin, startRightDock - aiDelta);
+                var actualShrink = startRightDock - newRightDock;
+                newAi = startAi + actualShrink;
+                _workspaceGrid.ColumnDefinitions[_dockColumnIndex].Width = new GridLength(newRightDock);
+                _rightDockWidth = newRightDock;
+            }
+            // No dock → AI grows by pushing into the star center column directly.
+            _workspaceGrid.ColumnDefinitions[_aiColumnIndex].Width = new GridLength(newAi);
+            _aiPanelWidth = newAi;
         };
 
         handle.PointerReleased += (_, e) =>
@@ -747,6 +851,11 @@ public sealed class EditorWindow : Window
         return BorderBox(stack, BorderColor, 1, 1, 0, 0);
     }
 
+    private readonly TextBlock _bgTasksReadout = new();
+    private Avalonia.Threading.DispatcherTimer? _spinnerTimer;
+    private int _spinnerFrame;
+    private static readonly string[] SpinnerFrames = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
+
     private Control BuildStatusBar()
     {
         _status.Foreground = Brush(TextDim);
@@ -759,14 +868,64 @@ public sealed class EditorWindow : Window
         _cursorReadout.Padding = new Thickness(8, 4, 12, 0);
         _cursorReadout.Text = "x: -  y: -";
 
+        _bgTasksReadout.Foreground = Brush(Accent);
+        _bgTasksReadout.FontFamily = new FontFamily("Menlo");
+        _bgTasksReadout.FontSize = 11;
+        _bgTasksReadout.Padding = new Thickness(8, 4, 8, 0);
+        _bgTasksReadout.Text = "";
+        Services.BackgroundTasks.Changed += RefreshBackgroundTasksReadout;
+        RefreshBackgroundTasksReadout();
+
         var bar = new Grid
         {
-            ColumnDefinitions = new ColumnDefinitions("*,Auto"),
+            ColumnDefinitions = new ColumnDefinitions("*,Auto,Auto"),
             Background = Brush(MenuBackground)
         };
         bar.Children.Add(_status.At(column: 0));
-        bar.Children.Add(_cursorReadout.At(column: 1));
+        bar.Children.Add(_bgTasksReadout.At(column: 1));
+        bar.Children.Add(_cursorReadout.At(column: 2));
         return bar;
+    }
+
+    /// <summary>Recompute the status-bar widget that summarises the in-flight background
+    /// jobs. Shows "spinner N · title (detail · 45%)" when active, blank otherwise.</summary>
+    private void RefreshBackgroundTasksReadout()
+    {
+        var active = Services.BackgroundTasks.Active;
+        if (active.Count == 0)
+        {
+            _bgTasksReadout.Text = "";
+            StopSpinner();
+            return;
+        }
+
+        StartSpinner();
+        // Show the most recently started task — it's typically the one the user just
+        // kicked off and is waiting on. If there are several, prefix with a count badge.
+        var head = active[^1];
+        var spinner = SpinnerFrames[_spinnerFrame % SpinnerFrames.Length];
+        var pct = head.Progress is { } p ? $" · {(int)(p * 100)}%" : "";
+        var detail = string.IsNullOrEmpty(head.Detail) ? "" : " · " + head.Detail;
+        var count = active.Count > 1 ? $" (+{active.Count - 1})" : "";
+        _bgTasksReadout.Text = $"{spinner} {head.Title}{detail}{pct}{count}";
+    }
+
+    private void StartSpinner()
+    {
+        if (_spinnerTimer is not null) return;
+        _spinnerTimer = new Avalonia.Threading.DispatcherTimer { Interval = TimeSpan.FromMilliseconds(90) };
+        _spinnerTimer.Tick += (_, _) =>
+        {
+            _spinnerFrame++;
+            RefreshBackgroundTasksReadout();
+        };
+        _spinnerTimer.Start();
+    }
+
+    private void StopSpinner()
+    {
+        _spinnerTimer?.Stop();
+        _spinnerTimer = null;
     }
 
     private void WireEvents()
@@ -909,6 +1068,10 @@ public sealed class EditorWindow : Window
             if (meta && e.KeyModifiers.HasFlag(KeyModifiers.Shift) && e.Key == Key.A)
             {
                 ToggleAiPanel(); e.Handled = true; return;
+            }
+            if (meta && e.KeyModifiers.HasFlag(KeyModifiers.Shift) && e.Key == Key.I)
+            {
+                ToggleRightDock(); e.Handled = true; return;
             }
             if (meta && e.Key == Key.P) { OpenQuickFile(); e.Handled = true; return; }
             if (meta && e.KeyModifiers.HasFlag(KeyModifiers.Shift) && e.Key == Key.F)
@@ -1494,8 +1657,12 @@ public sealed class EditorWindow : Window
             _history.Clear();
             _console.Log("Restored scene from workspace", "OK");
             RenderAll();
+            RestoreTabs(ws.OpenTabs, ws.ActiveTabKey);
             return;
         }
+
+        // Even when no scene was embedded, we still want to reopen the user's tabs.
+        RestoreTabs(ws.OpenTabs, ws.ActiveTabKey);
 
         if (!string.IsNullOrWhiteSpace(ws.LastScenePath) && File.Exists(ws.LastScenePath))
         {
@@ -1548,7 +1715,9 @@ public sealed class EditorWindow : Window
             ShowGrid = _sceneCanvas.ShowGrid,
             SnapToGrid = _sceneCanvas.SnapToGrid,
             LastScenePath = _lastScenePath ?? "",
-            Scene = _scene
+            Scene = _scene,
+            OpenTabs = _tabs.OpenKeys.ToList(),
+            ActiveTabKey = _tabs.ActiveKey ?? "",
         }.Save(_projectPath);
     }
 
@@ -1658,28 +1827,44 @@ public sealed class EditorWindow : Window
     /// Game.DesktopGL/Game.DesktopGL.csproj) — the shared library lacks OutputType and so
     /// is correctly skipped.
     /// </summary>
+    private static readonly HashSet<string> CsprojSkipDirs = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "bin", "obj", ".git", ".vs", ".idea", ".vscode", "node_modules", "packages", ".nuget"
+    };
+
     private static string? FindRunnableCsproj(string projectRoot)
     {
-        IEnumerable<string> all;
-        try { all = Directory.EnumerateFiles(projectRoot, "*.csproj", SearchOption.AllDirectories); }
-        catch { return null; }
-
-        string? fallback = null;
-        foreach (var csproj in all)
+        // Hand-rolled BFS that skips bin/obj/.git/etc. — `EnumerateFiles(..., AllDirectories)`
+        // walks them anyway and on a fully-built project that means thousands of restored
+        // package files plus huge bin/Debug trees, which froze the UI for tens of seconds.
+        var queue = new Queue<string>();
+        queue.Enqueue(projectRoot);
+        while (queue.Count > 0)
         {
-            fallback ??= csproj;
-            string text;
-            try { text = File.ReadAllText(csproj); }
-            catch { continue; }
-            // Quick string check is enough — XML parsing would be overkill for this hint.
-            if (text.Contains("<OutputType>Exe</OutputType>", StringComparison.OrdinalIgnoreCase) ||
-                text.Contains("<OutputType>WinExe</OutputType>", StringComparison.OrdinalIgnoreCase))
+            var dir = queue.Dequeue();
+            try
             {
-                return csproj;
+                foreach (var csproj in Directory.EnumerateFiles(dir, "*.csproj"))
+                {
+                    string text;
+                    try { text = File.ReadAllText(csproj); }
+                    catch { continue; }
+                    if (text.Contains("<OutputType>Exe</OutputType>", StringComparison.OrdinalIgnoreCase) ||
+                        text.Contains("<OutputType>WinExe</OutputType>", StringComparison.OrdinalIgnoreCase))
+                    {
+                        return csproj;
+                    }
+                }
+                foreach (var sub in Directory.EnumerateDirectories(dir))
+                {
+                    var name = Path.GetFileName(sub);
+                    if (name.StartsWith('.')) continue;
+                    if (CsprojSkipDirs.Contains(name)) continue;
+                    queue.Enqueue(sub);
+                }
             }
+            catch { /* unauthorized / IO — skip subtree */ }
         }
-        // No executable found → return null. The caller decides what to do (we leave Play
-        // disabled rather than guess a library project that would just fail at runtime).
         return null;
     }
 
@@ -1716,6 +1901,8 @@ public sealed class EditorWindow : Window
         _console.FocusBuildTab();
 
         var token = _runCts.Token;
+        using var bgTask = Services.BackgroundTasks.Begin("Game running");
+        bgTask.Update(Path.GetFileName(csproj));
         // Same flags as Build (see DotnetAsync) — disable terminal logger so the regex can
         // pick up compile-time errors emitted during the implicit build phase of `run`.
         var exit = await ProcessRunner.RunAsync(
@@ -1804,6 +1991,8 @@ public sealed class EditorWindow : Window
         _console.Log($"dotnet {verb} {Path.GetFileName(csproj)}");
         _console.ResetBuild();
         _console.FocusBuildTab();
+        using var task = Services.BackgroundTasks.Begin($"dotnet {verb}");
+        task.Update(Path.GetFileName(csproj));
         // Disable the modern Terminal Logger so MSBuild emits parseable per-line diagnostics
         // instead of the ANSI/progress-bar pretty output (which our error regex can't read).
         // -nologo trims the version banner, -v normal makes sure each diagnostic line is
@@ -1830,16 +2019,24 @@ public sealed class EditorWindow : Window
         }
 
         var key = node.FullPath;
-        _tabs.OpenOrFocus(key, node.Name, () =>
-        {
-            var content = AssetViewers.For(node, _pixelEditor, SetActiveColor);
-            if (content is CodeEditor codeEditor)
-            {
-                codeEditor.DirtyChanged += editor => _tabs.SetDirty(editor.FilePath, editor.IsDirty);
-            }
-            return content;
-        });
+        _tabs.OpenOrFocus(key, node.Name, () => BuildTabContentForFile(node.FullPath, node.Name));
         Services.UserSettings.Current.PushRecentFile(node.FullPath);
+    }
+
+    /// <summary>
+    /// Single source of truth for building a tab's content from a file path. Handles
+    /// dirty-flag wiring for every editor type that supports it (CodeEditor, MapEditor)
+    /// so the tab title shows the • indicator without each call site having to remember.
+    /// </summary>
+    private Control BuildTabContentForFile(string fullPath, string displayName)
+    {
+        var node = new Models.ProjectTreeNode { Name = displayName, FullPath = fullPath, IsDirectory = false };
+        var content = AssetViewers.For(node, _pixelEditor, SetActiveColor);
+        if (content is CodeEditor codeEditor)
+            codeEditor.DirtyChanged += editor => _tabs.SetDirty(editor.FilePath, editor.IsDirty);
+        else if (content is MapEditor mapEditor)
+            mapEditor.DirtyChanged += ed => _tabs.SetDirty(ed.FilePath, ed.IsDirty);
+        return content;
     }
 
     private void FindAssetUsages(Models.ProjectTreeNode node)
@@ -1967,6 +2164,51 @@ public sealed class EditorWindow : Window
     }
 
     /// <summary>
+    /// Prompt the user for a destination .mfmap path, scaffold a 3D map with default
+    /// camera + sun, save it, and open the editor tab focused on it.
+    /// </summary>
+    private async Task NewMapAsync()
+    {
+        var file = await StorageProvider.SaveFilePickerAsync(new FilePickerSaveOptions
+        {
+            Title = "Create new .mfmap",
+            SuggestedFileName = "NewMap.mfmap",
+            FileTypeChoices = new[] { new FilePickerFileType("MonoForge Map") { Patterns = new[] { "*.mfmap" } } }
+        });
+        if (file is null) return;
+        var path = file.Path.LocalPath;
+        var doc = Services.MapJson.CreateTemplate3D(Path.GetFileNameWithoutExtension(path));
+        Services.MapJson.Save(path, doc);
+        _tabs.OpenOrFocus(path, Path.GetFileName(path), () =>
+        {
+            var editor = new MapEditor(path, doc);
+            editor.DirtyChanged += ed => _tabs.SetDirty(ed.FilePath, ed.IsDirty);
+            return editor;
+        });
+        _console.Log("Created map: " + path, "OK");
+    }
+
+    /// <summary>Pick an existing .mfmap from disk and open it in a Map Editor tab.</summary>
+    private async Task OpenMapAsync()
+    {
+        var picked = await StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions
+        {
+            Title = "Open .mfmap",
+            AllowMultiple = false,
+            FileTypeFilter = new[] { new FilePickerFileType("MonoForge Map") { Patterns = new[] { "*.mfmap" } } }
+        });
+        var file = picked.FirstOrDefault();
+        if (file is null) return;
+        var path = file.Path.LocalPath;
+        // Routes through the unified tab builder so dirty-tracking + dispatch via
+        // AssetViewers (which knows how to load .mfmap) stay consistent with opening
+        // the file from the asset tree.
+        _tabs.OpenOrFocus(path, Path.GetFileName(path), () => BuildTabContentForFile(path, Path.GetFileName(path)));
+        Services.UserSettings.Current.PushRecentFile(path);
+        _console.Log("Opened map: " + path, "OK");
+    }
+
+    /// <summary>
     /// Single source of truth for every action the user can invoke via ⌘⇧P.
     /// Mirrors the menu structure but flattens it; categories double as section labels.
     /// </summary>
@@ -1981,6 +2223,8 @@ public sealed class EditorWindow : Window
         });
         yield return new EditorCommand("Open Project…", "File", "", async () => await OpenProjectAsync());
         yield return new EditorCommand("Open Scene Tab", "File", "", OpenSceneTab);
+        yield return new EditorCommand("New 3D Map…", "File", "", async () => await NewMapAsync());
+        yield return new EditorCommand("Open Map…", "File", "", async () => await OpenMapAsync());
         yield return new EditorCommand("Save Scene", "File", "⌘S", async () => { if (!TrySaveActiveDocument()) await SaveSceneAsync(); });
         yield return new EditorCommand("Load Scene…", "File", "", async () => await LoadSceneAsync());
         yield return new EditorCommand("Quick Open File…", "File", "⌘P", OpenQuickFile);
@@ -2032,6 +2276,7 @@ public sealed class EditorWindow : Window
         yield return new EditorCommand("Find in Files…", "Code", "⌘⇧F", OpenFindInFiles);
         yield return new EditorCommand("Goto Symbol…", "Code", "⌘T", OpenGotoSymbol);
         yield return new EditorCommand("Toggle AI Assistant", "Code", "⌘⇧A", ToggleAiPanel);
+        yield return new EditorCommand("Toggle Properties Panel", "View", "⌘⇧I", ToggleRightDock);
 
         // Help
         yield return new EditorCommand("Show Keyboard Shortcuts", "Help", "", ShowShortcuts);
@@ -2079,16 +2324,37 @@ public sealed class EditorWindow : Window
             return;
         }
 
-        _tabs.OpenOrFocus(fullPath, Path.GetFileName(fullPath), () =>
-        {
-            var content = AssetViewers.For(new Models.ProjectTreeNode { Name = Path.GetFileName(fullPath), FullPath = fullPath, IsDirectory = false }, _pixelEditor, SetActiveColor);
-            if (content is CodeEditor ce) ce.DirtyChanged += editor => _tabs.SetDirty(editor.FilePath, editor.IsDirty);
-            return content;
-        });
+        _tabs.OpenOrFocus(fullPath, Path.GetFileName(fullPath), () => BuildTabContentForFile(fullPath, Path.GetFileName(fullPath)));
 
         if (_tabs.ActiveContent is CodeEditor active && active.FilePath == fullPath)
         {
             active.GoToLine(line);
+        }
+    }
+
+    /// <summary>
+    /// Reopen the tabs that were persisted in the workspace. Each key is either the
+    /// sentinel scene key or a file path. Missing files are silently skipped so a
+    /// stale workspace.json doesn't pop a sequence of error toasts on startup.
+    /// </summary>
+    private void RestoreTabs(IEnumerable<string> keys, string activeKey)
+    {
+        foreach (var key in keys)
+        {
+            if (key == SceneTabKey)
+            {
+                OpenSceneTab();
+                continue;
+            }
+            if (!File.Exists(key)) continue;
+            _tabs.OpenOrFocus(key, Path.GetFileName(key), () => BuildTabContentForFile(key, Path.GetFileName(key)));
+        }
+        // Re-focus the previously active tab so the user lands where they left off.
+        if (!string.IsNullOrEmpty(activeKey))
+        {
+            if (activeKey == SceneTabKey) OpenSceneTab();
+            else if (File.Exists(activeKey))
+                _tabs.OpenOrFocus(activeKey, Path.GetFileName(activeKey), () => BuildTabContentForFile(activeKey, Path.GetFileName(activeKey)));
         }
     }
 

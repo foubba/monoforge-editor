@@ -437,27 +437,95 @@ public sealed class CodeEditor : UserControl
     private static bool IsBraceLanguage(string ext) =>
         ext is ".cs" or ".js" or ".ts" or ".jsx" or ".tsx" or ".java" or ".cpp" or ".cc" or ".c"
             or ".h" or ".hpp" or ".rs" or ".go" or ".kt" or ".swift" or ".scss" or ".css"
-            or ".php" or ".json";
+            or ".php" or ".json" or ".jsonc" or ".glsl" or ".vert" or ".frag" or ".geom"
+            or ".tesc" or ".tese" or ".comp" or ".hlsl" or ".fx" or ".fxh" or ".cginc";
 
     private static bool IsIndentLanguage(string ext) =>
-        ext is ".py" or ".yml" or ".yaml";
+        ext is ".py" or ".yml" or ".yaml" or ".md" or ".markdown";
+
+    /// <summary>
+    /// Fallback ext→TextMate language-id map for extensions the registry doesn't bind
+    /// by default. The bundled grammars in TextMateSharp.Grammars 1.0.65 include json,
+    /// markdown, xml, and hlsl/shaderlab; .csproj / .axaml / shader-stage extensions
+    /// don't auto-resolve so we re-route them here. Returns null if no override applies
+    /// and the registry's default lookup should be used.
+    /// </summary>
+    private static string? FallbackLanguageId(string ext) => ext switch
+    {
+        ".json" or ".jsonc" or ".mfmap" => "json",
+        ".md" or ".markdown" or ".mdown" or ".mkd" => "markdown",
+        ".xml" or ".csproj" or ".vbproj" or ".fsproj" or ".props" or ".targets"
+            or ".axaml" or ".axml" or ".config" or ".nuspec" or ".resx" or ".plist"
+            or ".manifest" or ".storyboard" or ".xib" or ".xaml" => "xml",
+        ".glsl" or ".vert" or ".frag" or ".geom" or ".tesc" or ".tese" or ".comp" => "glsl",
+        ".hlsl" or ".fx" or ".fxh" or ".cginc" or ".compute" or ".shader" => "hlsl",
+        ".yml" or ".yaml" => "yaml",
+        ".html" or ".htm" or ".xhtml" => "html",
+        ".css" => "css",
+        ".scss" or ".sass" => "scss",
+        ".less" => "less",
+        ".sh" or ".bash" or ".zsh" or ".fish" => "shellscript",
+        ".toml" => "ini",
+        ".ini" or ".conf" => "ini",
+        ".sql" => "sql",
+        ".lua" => "lua",
+        ".rs" => "rust",
+        ".kt" or ".kts" => "kotlin",
+        ".swift" => "swift",
+        ".rb" => "ruby",
+        ".php" => "php",
+        ".go" => "go",
+        ".dart" => "dart",
+        ".dockerfile" => "dockerfile",
+        _ => null,
+    };
 
     private void ApplyLanguage(string filePath)
     {
         if (_installation is null) return;
 
-        var ext = Path.GetExtension(filePath);
-        var def = Registry.GetLanguageByExtension(ext);
-        if (def is not null)
+        var ext = Path.GetExtension(filePath).ToLowerInvariant();
+        // Try the override map first — covers shader stages, .csproj/.axaml,
+        // and our own .mfmap (which is JSON). Fall back to the registry's
+        // built-in extension table for anything else (.cs, .py, .ts, ...).
+        var fallback = FallbackLanguageId(ext);
+        string? resolvedId = null;
+        if (fallback is not null)
         {
-            _language = def.Id;
-            try { _installation.SetGrammar(Registry.GetScopeByLanguageId(def.Id)); }
-            catch (Exception ex) { _diagnosticsLabel = "grammar-fail: " + ex.GetType().Name; }
+            try
+            {
+                var scope = Registry.GetScopeByLanguageId(fallback);
+                if (!string.IsNullOrEmpty(scope))
+                {
+                    _installation.SetGrammar(scope);
+                    resolvedId = fallback;
+                }
+            }
+            catch { /* grammar missing in this bundle — fall through to default lookup */ }
         }
-        else
+
+        if (resolvedId is null)
+        {
+            var def = Registry.GetLanguageByExtension(ext);
+            if (def is not null)
+            {
+                try
+                {
+                    _installation.SetGrammar(Registry.GetScopeByLanguageId(def.Id));
+                    resolvedId = def.Id;
+                }
+                catch (Exception ex) { _diagnosticsLabel = "grammar-fail: " + ex.GetType().Name; }
+            }
+        }
+
+        if (resolvedId is null)
         {
             _language = "plaintext";
             try { _installation.SetGrammar(null); } catch { /* ignored */ }
+        }
+        else
+        {
+            _language = resolvedId;
         }
     }
 
@@ -483,7 +551,13 @@ public sealed class CodeEditor : UserControl
         "xml" => "XML",
         "html" => "HTML",
         "css" => "CSS",
+        "scss" => "SCSS",
         "markdown" => "Markdown",
+        "glsl" => "GLSL",
+        "hlsl" => "HLSL",
+        "shellscript" => "Shell",
+        "sql" => "SQL",
+        "ini" => "INI",
         "plaintext" or "" => "Plain Text",
         _ => char.ToUpper(id[0]) + id[1..],
     };

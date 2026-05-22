@@ -204,6 +204,14 @@ public sealed class ConsolePanel : UserControl
 
     public void Log(string message, string kind = "INFO")
     {
+        // Surface notable events as toasts so the user notices without having to open
+        // the console panel. INFO lines stay console-only (too noisy as toasts).
+        switch (kind)
+        {
+            case "OK":   ToastHost.Success(message); break;
+            case "WARN": ToastHost.Warn(message); break;
+            case "ERR":  ToastHost.Error(message); break;
+        }
         var stamp = DateTime.Now.ToString("HH:mm:ss");
         _consoleLines.Add((stamp, kind, message));
         if (_consoleLines.Count > 5000) _consoleLines.RemoveRange(0, 1000);
